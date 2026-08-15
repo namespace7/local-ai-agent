@@ -1,3 +1,8 @@
+import type { Message, ModelResponse, ToolDefinition } from "./types.js";
+
 export interface ModelProvider {
-  generate(prompt: string): Promise<string>;
+  generate(
+    messages: Message[],
+    tools: ToolDefinition[],
+  ): Promise<ModelResponse>;
 }
