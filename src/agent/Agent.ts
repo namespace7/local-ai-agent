@@ -2,16 +2,37 @@ import type { ModelProvider } from "../models/ModelProvider.js";
 import type { Message } from "../models/types.js";
 import type { ToolRegistry } from "../tools/ToolRegistry.js";
 import { ExecutionTrace } from "../observability/ExecutionTrace.js";
+import type { ProjectMemory } from "../memory/ProjectMemory.js";
 
 export class Agent {
   constructor(
     private readonly model: ModelProvider,
     private readonly tools: ToolRegistry,
     private readonly trace: ExecutionTrace,
+    private readonly memory: ProjectMemory,
   ) {}
 
   async run(prompt: string): Promise<string> {
+    const memoryEntries = this.memory.search(prompt);
+
+    const memoryContext =
+      memoryEntries.length > 0
+        ? memoryEntries
+            .map((entry) => `[${entry.category}] ${entry.content}`)
+            .join("\n")
+        : "No relevant project memory was found.";
+
     const messages: Message[] = [
+      {
+        role: "system",
+        content: `You are a local project agent.
+
+Use the following project memory when it is relevant:
+
+${memoryContext}
+
+Do not invent project-specific facts that are not supported by the available memory or tools.`,
+      },
       {
         role: "user",
         content: prompt,
@@ -19,6 +40,8 @@ export class Agent {
     ];
 
     const maxIterations = 10;
+
+    const executedToolCalls = new Set<string>();
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       const modelStartedAt = Date.now();
@@ -50,6 +73,38 @@ export class Agent {
           `\n[tool] ${toolCall.name}`,
           JSON.stringify(toolCall.arguments),
         );
+
+        const toolCallKey = JSON.stringify({
+          name: toolCall.name,
+          arguments: toolCall.arguments,
+        });
+
+        if (executedToolCalls.has(toolCallKey)) {
+          const duplicateMessage =
+            "This exact tool call has already been executed successfully. Do not call it again. Continue with the task or provide the final answer.";
+
+          this.trace.add({
+            type: "tool",
+            iteration,
+            toolName: toolCall.name,
+            durationMs: 0,
+            success: false,
+            error: "Duplicate tool call prevented",
+          });
+
+          messages.push({
+            role: "tool",
+            toolCallId: toolCall.id,
+            content: JSON.stringify({
+              success: false,
+              error: duplicateMessage,
+            }),
+          });
+
+          continue;
+        }
+
+        executedToolCalls.add(toolCallKey);
 
         const tool = this.tools.get(toolCall.name);
 

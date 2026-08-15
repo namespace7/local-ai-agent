@@ -10,6 +10,8 @@ import { BrowserSnapshotTool } from "./tools/browser/BrowserSnapshotTool.js";
 import { BrowserClickTool } from "./tools/browser/BrowserClickTool.js";
 import { BrowserFillTool } from "./tools/browser/BrowserFillTool.js";
 import { ExecutionTrace } from "./observability/ExecutionTrace.js";
+import { ProjectMemory } from "./memory/ProjectMemory.js";
+import { RememberTool } from "./memory/RememberTool.js";
 
 async function main(): Promise<void> {
   const prompt = process.argv.slice(2).join(" ");
@@ -25,6 +27,7 @@ async function main(): Promise<void> {
   const browser = new BrowserManager();
 
   const tools = new ToolRegistry();
+  const memory = new ProjectMemory("./data/project-memory.json");
 
   tools.register(new ListDirectoryTool(workspace));
   tools.register(new ReadFileTool(workspace));
@@ -32,12 +35,16 @@ async function main(): Promise<void> {
   tools.register(new BrowserSnapshotTool(browser));
   tools.register(new BrowserFillTool(browser));
   tools.register(new BrowserClickTool(browser));
+  tools.register(new RememberTool(memory));
 
   const model = new OllamaProvider();
 
   const trace = new ExecutionTrace();
 
-  const agent = new Agent(model, tools, trace);
+  await memory.load();
+
+
+  const agent = new Agent(model, tools, trace, memory);
 
   console.log("Thinking...\n");
 
