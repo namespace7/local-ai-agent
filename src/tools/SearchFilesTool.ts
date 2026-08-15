@@ -139,7 +139,7 @@ export class SearchFilesTool implements Tool {
 
     const lines = content.split(/\r?\n/);
 
-    const queryPattern = new RegExp(`\\b${this.escapeRegExp(query)}\\b`, "i");
+    const queryTokens = query.toLowerCase().split(/\s+/).filter(Boolean);
 
     for (let index = 0; index < lines.length; index += 1) {
       if (matches.length >= maxResults) {
@@ -154,7 +154,11 @@ export class SearchFilesTool implements Tool {
 
       const lineText = line.toLowerCase();
 
-      if (queryPattern.test(lineText)) {
+      const matchesQuery = queryTokens.every((token) =>
+        lineText.includes(token),
+      );
+
+      if (matchesQuery) {
         matches.push({
           path: this.workspace.relativePath(filePath),
           line: index + 1,

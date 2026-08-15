@@ -3,6 +3,7 @@ import type { Message } from "../models/types.js";
 import type { ToolRegistry } from "../tools/ToolRegistry.js";
 import { ExecutionTrace } from "../observability/ExecutionTrace.js";
 import type { ProjectMemory } from "../memory/ProjectMemory.js";
+import { AgentToolExecutor } from "./AgentToolExecutor.js";
 
 export class Agent {
   constructor(
@@ -64,6 +65,8 @@ export class Agent {
 
     const executedToolCalls = new Set<string>();
 
+    const toolExecutor = new AgentToolExecutor(this.tools, this.trace);
+
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       const modelStartedAt = Date.now();
 
@@ -90,85 +93,13 @@ export class Agent {
       }
 
       for (const toolCall of response.toolCalls) {
-        console.log(
-          `\n[tool] ${toolCall.name}`,
-          JSON.stringify(toolCall.arguments),
+        const toolMessage = await toolExecutor.execute(
+          toolCall,
+          iteration,
+          executedToolCalls,
         );
 
-        const toolCallKey = JSON.stringify({
-          name: toolCall.name,
-          arguments: toolCall.arguments,
-        });
-
-        if (executedToolCalls.has(toolCallKey)) {
-          const duplicateMessage =
-            "This exact tool call has already been executed successfully. Do not call it again. Continue with the task or provide the final answer.";
-
-          this.trace.add({
-            type: "tool",
-            iteration,
-            toolName: toolCall.name,
-            durationMs: 0,
-            success: false,
-            error: "Duplicate tool call prevented",
-          });
-
-          messages.push({
-            role: "tool",
-            toolCallId: toolCall.id,
-            content: JSON.stringify({
-              success: false,
-              error: duplicateMessage,
-            }),
-          });
-
-          continue;
-        }
-
-        executedToolCalls.add(toolCallKey);
-
-        const tool = this.tools.get(toolCall.name);
-
-        const toolStartedAt = Date.now();
-
-        try {
-          const result = await tool.execute(toolCall.arguments);
-          console.log("[tool-result]", JSON.stringify(result, null, 2));
-
-          this.trace.add({
-            type: "tool",
-            iteration,
-            toolName: toolCall.name,
-            durationMs: Date.now() - toolStartedAt,
-            success: true,
-          });
-
-          messages.push({
-            role: "tool",
-            toolCallId: toolCall.id,
-            content: JSON.stringify(result),
-          });
-        } catch (error: unknown) {
-          const message =
-            error instanceof Error ? error.message : String(error);
-
-          this.trace.add({
-            type: "tool",
-            iteration,
-            toolName: toolCall.name,
-            durationMs: Date.now() - toolStartedAt,
-            success: false,
-            error: message,
-          });
-
-          messages.push({
-            role: "tool",
-            toolCallId: toolCall.id,
-            content: JSON.stringify({
-              error: message,
-            }),
-          });
-        }
+        messages.push(toolMessage);
       }
     }
 
