@@ -9,6 +9,7 @@ import { BrowserNavigateTool } from "./tools/browser/BrowserNavigateTool.js";
 import { BrowserSnapshotTool } from "./tools/browser/BrowserSnapshotTool.js";
 import { BrowserClickTool } from "./tools/browser/BrowserClickTool.js";
 import { BrowserFillTool } from "./tools/browser/BrowserFillTool.js";
+import { ExecutionTrace } from "./observability/ExecutionTrace.js";
 
 async function main(): Promise<void> {
   const prompt = process.argv.slice(2).join(" ");
@@ -34,11 +35,38 @@ async function main(): Promise<void> {
 
   const model = new OllamaProvider();
 
-  const agent = new Agent(model, tools);
+  const trace = new ExecutionTrace();
+
+  const agent = new Agent(model, tools, trace);
 
   console.log("Thinking...\n");
 
   const answer = await agent.run(prompt);
+
+  console.log("\n--- Execution Trace ---");
+
+  for (const event of trace.getEvents()) {
+    if (event.type === "model") {
+      console.log(
+        `[model] iteration=${event.iteration} ` +
+          `duration=${event.durationMs}ms ` +
+          `toolCalls=${event.toolCallCount}`,
+      );
+    } else {
+      console.log(
+        `[tool] iteration=${event.iteration} ` +
+          `name=${event.toolName} ` +
+          `duration=${event.durationMs}ms ` +
+          `success=${event.success}`,
+      );
+
+      if (event.error) {
+        console.log(`       error=${event.error}`);
+      }
+    }
+  }
+
+  console.log(`[trace] total=${trace.totalDurationMs()}ms`);
 
   console.log("\n" + answer);
 

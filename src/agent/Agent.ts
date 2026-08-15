@@ -1,11 +1,13 @@
 import type { ModelProvider } from "../models/ModelProvider.js";
 import type { Message } from "../models/types.js";
 import type { ToolRegistry } from "../tools/ToolRegistry.js";
+import { ExecutionTrace } from "../observability/ExecutionTrace.js";
 
 export class Agent {
   constructor(
     private readonly model: ModelProvider,
     private readonly tools: ToolRegistry,
+    private readonly trace: ExecutionTrace,
   ) {}
 
   async run(prompt: string): Promise<string> {
@@ -19,10 +21,19 @@ export class Agent {
     const maxIterations = 10;
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+      const modelStartedAt = Date.now();
+
       const response = await this.model.generate(
         messages,
         this.tools.getDefinitions(),
       );
+
+      this.trace.add({
+        type: "model",
+        iteration,
+        durationMs: Date.now() - modelStartedAt,
+        toolCallCount: response.toolCalls.length,
+      });
 
       messages.push({
         role: "assistant",
@@ -42,8 +53,18 @@ export class Agent {
 
         const tool = this.tools.get(toolCall.name);
 
+        const toolStartedAt = Date.now();
+
         try {
           const result = await tool.execute(toolCall.arguments);
+
+          this.trace.add({
+            type: "tool",
+            iteration,
+            toolName: toolCall.name,
+            durationMs: Date.now() - toolStartedAt,
+            success: true,
+          });
 
           messages.push({
             role: "tool",
@@ -53,6 +74,15 @@ export class Agent {
         } catch (error: unknown) {
           const message =
             error instanceof Error ? error.message : String(error);
+
+          this.trace.add({
+            type: "tool",
+            iteration,
+            toolName: toolCall.name,
+            durationMs: Date.now() - toolStartedAt,
+            success: false,
+            error: message,
+          });
 
           messages.push({
             role: "tool",
