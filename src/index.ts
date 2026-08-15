@@ -7,6 +7,8 @@ import { Workspace } from "./workspace/Workspace.js";
 import { BrowserManager } from "./tools/browser/BrowserManager.js";
 import { BrowserNavigateTool } from "./tools/browser/BrowserNavigateTool.js";
 import { BrowserSnapshotTool } from "./tools/browser/BrowserSnapshotTool.js";
+import { BrowserClickTool } from "./tools/browser/BrowserClickTool.js";
+import { BrowserFillTool } from "./tools/browser/BrowserFillTool.js";
 
 async function main(): Promise<void> {
   const prompt = process.argv.slice(2).join(" ");
@@ -27,6 +29,8 @@ async function main(): Promise<void> {
   tools.register(new ReadFileTool(workspace));
   tools.register(new BrowserNavigateTool(browser));
   tools.register(new BrowserSnapshotTool(browser));
+  tools.register(new BrowserFillTool(browser));
+  tools.register(new BrowserClickTool(browser));
 
   const model = new OllamaProvider();
 
