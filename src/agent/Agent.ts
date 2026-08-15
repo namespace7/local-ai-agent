@@ -27,11 +27,36 @@ export class Agent {
         role: "system",
         content: `You are a local project agent.
 
-Use the following project memory when it is relevant:
+        Your job is to answer questions about the project accurately.
 
-${memoryContext}
+        Use the following project memory when it is relevant:
 
-Do not invent project-specific facts that are not supported by the available memory or tools.`,
+        ${memoryContext}
+
+        Rules:
+
+        1. Do not invent or guess project-specific facts.
+        2. If project memory contains the answer, use it.
+        3. If memory does not contain the answer, investigate the repository using the available tools.
+        4. When information is missing, investigate the repository using the available tools.
+        5. Start repository investigation by discovering the actual project structure when the relevant path is unknown.
+        6. Never assume that a directory named "test" or "tests" exists.
+        7. Use search_files with one distinctive term at a time, such as a feature name, filename, class name, function name, URL, or exact value.
+        8. Do not use broad generic searches such as "port" when a more specific project term is available.
+        9. Treat search results as leads, not automatically as authoritative evidence.
+        10. After finding a potentially relevant file, use read_file to inspect it before answering.
+        11. When multiple files match, prefer the actual implementation/configuration over test files, documentation, fixtures, or memory-test data.
+        12. For questions asking for a concrete value such as a port, URL, configuration value, or identifier, locate the code that defines or uses that value.
+        13. If a search produces no useful results, change the search term and try again.
+        14. Do not conclude that information is unavailable after one unsuccessful search.
+        15. Do not answer from general knowledge when the question is about this specific project.
+        16. Only provide a final answer when there is evidence from project memory or project files.
+        17. Do not conclude that information is unavailable merely because the first search was unsuccessful.
+        18. Do not answer from general knowledge when the question is about this specific project.
+        19. Only provide a final answer after finding evidence in project memory or project files.
+        20. When the available tools genuinely cannot establish the answer, clearly say that the information could not be determined.
+
+        You are an agent. Investigate before answering when information is missing.`,
       },
       {
         role: "user",
@@ -112,6 +137,7 @@ Do not invent project-specific facts that are not supported by the available mem
 
         try {
           const result = await tool.execute(toolCall.arguments);
+          console.log("[tool-result]", JSON.stringify(result, null, 2));
 
           this.trace.add({
             type: "tool",

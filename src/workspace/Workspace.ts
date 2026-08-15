@@ -21,4 +21,15 @@ export class Workspace {
 
     return resolvedPath;
   }
+
+  relativePath(inputPath: string): string {
+    const resolvedPath = resolve(inputPath);
+    const relativePath = relative(this.root, resolvedPath);
+
+    if (relativePath.startsWith("..") || isAbsolute(relativePath)) {
+      throw new Error("Path is outside the workspace");
+    }
+
+    return relativePath || ".";
+  }
 }
