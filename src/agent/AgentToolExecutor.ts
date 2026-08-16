@@ -2,6 +2,12 @@ import type { ToolRegistry } from "../tools/ToolRegistry.js";
 import type { ToolCall, Message } from "../models/types.js";
 import { ExecutionTrace } from "../observability/ExecutionTrace.js";
 
+export interface ToolExecutionResult {
+  message: Message;
+  duplicate: boolean;
+  result?: unknown;
+}
+
 export class AgentToolExecutor {
   constructor(
     private readonly tools: ToolRegistry,
@@ -12,20 +18,17 @@ export class AgentToolExecutor {
     toolCall: ToolCall,
     iteration: number,
     executedToolCalls: Set<string>,
-  ): Promise<Message> {
+  ): Promise<ToolExecutionResult> {
     console.log(
       `\n[tool] ${toolCall.name}`,
       JSON.stringify(toolCall.arguments),
     );
 
-    const toolCallKey = JSON.stringify({
-      name: toolCall.name,
-      arguments: toolCall.arguments,
-    });
+    const toolCallKey = this.createToolCallKey(toolCall);
 
     if (executedToolCalls.has(toolCallKey)) {
       const duplicateMessage =
-        "This exact tool call has already been executed successfully. Do not call it again. Continue with the task or provide the final answer.";
+        "This exact tool call has already been executed successfully. Use the previous tool result and provide the final answer. Do not call this tool again.";
 
       this.trace.add({
         type: "tool",
@@ -37,13 +40,16 @@ export class AgentToolExecutor {
       });
 
       return {
-        role: "tool",
-        toolCallId: toolCall.id,
-        content: JSON.stringify({
-          success: false,
-          error: duplicateMessage,
-        }),
-      }
+        duplicate: true,
+        message: {
+          role: "tool",
+          toolCallId: toolCall.id,
+          content: JSON.stringify({
+            success: false,
+            error: duplicateMessage,
+          }),
+        },
+      };
     }
 
     executedToolCalls.add(toolCallKey);
@@ -65,10 +71,14 @@ export class AgentToolExecutor {
       });
 
       return {
-        role: "tool",
-        toolCallId: toolCall.id,
-        content: JSON.stringify(result),
-      }
+        duplicate: false,
+        result,
+        message: {
+          role: "tool",
+          toolCallId: toolCall.id,
+          content: JSON.stringify(result),
+        },
+      };
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
 
@@ -82,12 +92,29 @@ export class AgentToolExecutor {
       });
 
       return {
-        role: "tool",
-        toolCallId: toolCall.id,
-        content: JSON.stringify({
-          error: message,
-        }),
-      }
+        duplicate: false,
+        message: {
+          role: "tool",
+          toolCallId: toolCall.id,
+          content: JSON.stringify({
+            error: message,
+          }),
+        },
+      };
     }
+  }
+
+  private createToolCallKey(toolCall: ToolCall): string {
+    const sortedArguments = Object.keys(toolCall.arguments)
+      .sort()
+      .reduce<Record<string, unknown>>((result, key) => {
+        result[key] = toolCall.arguments[key];
+        return result;
+      }, {});
+
+    return JSON.stringify({
+      name: toolCall.name,
+      arguments: sortedArguments,
+    });
   }
 }

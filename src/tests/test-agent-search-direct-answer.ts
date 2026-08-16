@@ -46,6 +46,14 @@ if (answer !== expectedAnswer) {
 
 const events = trace.getEvents();
 
+const modelEvents = events.filter((event) => event.type === "model");
+
+if (modelEvents.length !== 1) {
+  throw new Error(
+    `Expected exactly 1 model execution, received ${modelEvents.length}`,
+  );
+}
+
 const toolEvents = events.filter((event) => event.type === "tool");
 
 if (toolEvents.length !== 1) {
@@ -61,4 +69,4 @@ if (
   throw new Error("Expected search_files to be the only tool execution");
 }
 
-console.log("PASS: agent investigation search -> direct answer");
+console.log("PASS: agent search -> direct answer without second model call");

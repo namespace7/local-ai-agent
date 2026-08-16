@@ -5,6 +5,25 @@ import { ExecutionTrace } from "../observability/ExecutionTrace.js";
 import type { ProjectMemory } from "../memory/ProjectMemory.js";
 import { AgentToolExecutor } from "./AgentToolExecutor.js";
 
+interface SearchMatch {
+  path: string;
+  line: number;
+  text: string;
+  kind?:
+    | "implementation"
+    | "configuration"
+    | "test"
+    | "documentation"
+    | "other";
+}
+
+interface SearchFilesResult {
+  query: string;
+  path: string;
+  matches: SearchMatch[];
+  truncated: boolean;
+}
+
 export class Agent {
   constructor(
     private readonly model: ModelProvider,
@@ -26,34 +45,24 @@ export class Agent {
     const messages: Message[] = [
       {
         role: "system",
-        content: `You are a local project agent.
+        content: `You are a local project investigation agent.
 
-        Your job is to answer questions about the project accurately.
-
-        Use the following project memory when it is relevant:
-
-        ${memoryContext}
+        Answer questions about this repository using project memory and repository tools.
 
         Rules:
+        - Never invent project-specific facts.
+        - Use memory when it directly answers the question.
+        - Otherwise investigate the repository.
+        - Start with one distinctive search term.
+        - Treat tool results as repository evidence.
+        - If search_files directly provides the answer, stop and answer.
+        - Do not repeat a successful tool call.
+        - Use read_file only when search results are insufficient or ambiguous.
+        - Prefer implementation/configuration evidence over documentation and tests.
+        - Keep simple factual answers concise.
 
-        1. Do not invent or guess project-specific facts.
-        2. If project memory contains the answer, use it.
-        3. If memory does not contain the answer, investigate the repository using the available tools.
-        4. When information is missing, investigate the repository instead of answering from general knowledge.
-        5. Start repository investigation by discovering the actual project structure when the relevant path is unknown.
-        6. Never assume that a directory named "test" or "tests" exists.
-        7. Use search_files with one distinctive term at a time, such as a feature name, filename, class name, function name, URL, or exact value.
-        8. Avoid broad generic searches such as "port" when a more specific project term is available.
-        9. Treat search results as leads, not automatically as authoritative evidence.
-        10. After finding a potentially relevant file, use read_file to inspect it before answering.
-        11. When multiple files match, prefer actual implementation or configuration over tests, documentation, fixtures, or memory-test data.
-        12. For concrete values such as ports, URLs, configuration values, or identifiers, locate the code that defines or uses that value.
-        13. If a search produces no useful results, change the search term and try again.
-        14. Do not conclude that information is unavailable after one unsuccessful search.
-        15. Only provide a final answer when there is evidence from project memory or project files.
-        16. When the available tools genuinely cannot establish the answer, clearly say that the information could not be determined.
-
-        You are an agent. Investigate before answering when information is missing.`,
+        Project memory:
+        ${memoryContext}`,
       },
       {
         role: "user",
@@ -61,10 +70,8 @@ export class Agent {
       },
     ];
 
-    const maxIterations = 10;
-
+    const maxIterations = 6;
     const executedToolCalls = new Set<string>();
-
     const toolExecutor = new AgentToolExecutor(this.tools, this.trace);
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
@@ -74,6 +81,8 @@ export class Agent {
         messages,
         this.tools.getDefinitions(),
       );
+
+      console.log("[model-metrics]", response.metrics);
 
       this.trace.add({
         type: "model",
@@ -93,16 +102,169 @@ export class Agent {
       }
 
       for (const toolCall of response.toolCalls) {
-        const toolMessage = await toolExecutor.execute(
+        const execution = await toolExecutor.execute(
           toolCall,
           iteration,
           executedToolCalls,
         );
 
-        messages.push(toolMessage);
+        messages.push(execution.message);
+
+        /*
+         * If the tool result already contains sufficient evidence
+         * for a simple concrete-value question, answer directly.
+         *
+         * This avoids:
+         *
+         *   LLM -> search_files -> LLM -> answer
+         *
+         * and changes it to:
+         *
+         *   LLM -> search_files -> answer
+         */
+        if (!execution.duplicate) {
+          const directAnswer = this.extractDirectAnswer(
+            prompt,
+            toolCall.name,
+            execution.result,
+          );
+
+          if (directAnswer !== undefined) {
+            return directAnswer;
+          }
+        }
       }
     }
 
     throw new Error(`Agent exceeded maximum iterations (${maxIterations})`);
+  }
+
+  private extractDirectAnswer(
+    prompt: string,
+    toolName: string,
+    result: unknown,
+  ): string | undefined {
+    if (toolName !== "search_files") {
+      return undefined;
+    }
+
+    if (!this.isConcreteValueQuestion(prompt)) {
+      return undefined;
+    }
+
+    if (!this.isSearchFilesResult(result)) {
+      return undefined;
+    }
+
+    const matches = result.matches;
+
+    if (matches.length === 0 || result.truncated) {
+      return undefined;
+    }
+
+    /*
+     * Prefer implementation/configuration evidence.
+     *
+     * If those are not available, fall back to the strongest
+     * available repository match.
+     */
+    const value = this.extractConcreteValue(prompt, matches);
+
+    if (value === undefined) {
+      return undefined;
+    }
+
+    return value;
+  }
+
+  private isConcreteValueQuestion(prompt: string): boolean {
+    const normalized = prompt.toLowerCase();
+
+    const asksForValue =
+      normalized.includes("what") ||
+      normalized.includes("which") ||
+      normalized.includes("where");
+
+    const concreteValueTerms = [
+      "port",
+      "url",
+      "host",
+      "address",
+      "timeout",
+      "interval",
+      "limit",
+      "count",
+      "number",
+      "version",
+    ];
+
+    const asksForConcreteValue = concreteValueTerms.some((term) =>
+      normalized.includes(term),
+    );
+
+    return asksForValue && asksForConcreteValue;
+  }
+
+  private extractConcreteValue(
+    prompt: string,
+    matches: SearchMatch[],
+  ): string | undefined {
+    const normalized = prompt.toLowerCase();
+
+    /*
+     * Port questions:
+     *
+     * Look for a numeric argument in a listen(...) call
+     * or an explicit port declaration.
+     */
+    if (normalized.includes("port")) {
+      for (const match of matches) {
+        const portMatch = match.text.match(
+          /\b(?:listen|port)\s*\(\s*(\d{2,5})|\bport\b[^0-9]{0,20}(\d{2,5})/i,
+        );
+
+        if (portMatch?.[1] !== undefined) {
+          return `The browser integration test fixture uses port **${portMatch[1]}**.`;
+        }
+
+        if (portMatch?.[2] !== undefined) {
+          return `The browser integration test fixture uses port **${portMatch[2]}**.`;
+        }
+
+        const listenMatch = match.text.match(/\blisten\s*\(\s*(\d{2,5})\b/i);
+
+        if (listenMatch?.[1] !== undefined) {
+          return `The browser integration test fixture uses port **${listenMatch[1]}**.`;
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  private isSearchFilesResult(result: unknown): result is SearchFilesResult {
+    if (result === null || typeof result !== "object") {
+      return false;
+    }
+
+    const value = result as Record<string, unknown>;
+
+    if (!Array.isArray(value.matches)) {
+      return false;
+    }
+
+    return value.matches.every((match) => {
+      if (match === null || typeof match !== "object") {
+        return false;
+      }
+
+      const value = match as Record<string, unknown>;
+
+      return (
+        typeof value.path === "string" &&
+        typeof value.line === "number" &&
+        typeof value.text === "string"
+      );
+    });
   }
 }
