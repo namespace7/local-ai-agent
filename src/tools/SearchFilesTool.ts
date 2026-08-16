@@ -9,10 +9,13 @@ interface SearchFilesInput {
   maxResults?: number;
 }
 
+type SearchMatchKind = "implementation" | "test" | "documentation" | "other";
+
 interface SearchMatch {
   path: string;
   line: number;
   text: string;
+  kind: SearchMatchKind;
 }
 
 export class SearchFilesTool implements Tool {
@@ -114,6 +117,7 @@ export class SearchFilesTool implements Tool {
           path: relativePath,
           line: 0,
           text: `[filename match] ${relativePath}`,
+          kind: this.classifyMatch(relativePath),
         });
 
         if (matches.length >= maxResults) {
@@ -121,12 +125,19 @@ export class SearchFilesTool implements Tool {
         }
       }
 
-      await this.searchFile(entryPath, query, matches, maxResults);
+      await this.searchFile(
+        entryPath,
+        relativePath,
+        query,
+        matches,
+        maxResults,
+      );
     }
   }
 
   private async searchFile(
     filePath: string,
+    relativePath: string,
     query: string,
     matches: SearchMatch[],
     maxResults: number,
@@ -160,12 +171,35 @@ export class SearchFilesTool implements Tool {
 
       if (matchesQuery) {
         matches.push({
-          path: this.workspace.relativePath(filePath),
+          path: relativePath,
           line: index + 1,
           text: line.trim(),
+          kind: this.classifyMatch(relativePath),
         });
       }
     }
+  }
+
+  private classifyMatch(path: string): SearchMatchKind {
+    const normalizedPath = path.toLowerCase();
+
+    if (
+      normalizedPath.includes("/tests/") ||
+      normalizedPath.includes(".test.") ||
+      normalizedPath.includes(".spec.")
+    ) {
+      return "test";
+    }
+
+    if (
+      normalizedPath.endsWith(".md") ||
+      normalizedPath.endsWith(".txt") ||
+      normalizedPath.includes("/docs/")
+    ) {
+      return "documentation";
+    }
+
+    return "implementation";
   }
 
   private shouldIgnore(entry: Dirent): boolean {

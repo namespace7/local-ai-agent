@@ -22,6 +22,13 @@ interface OllamaChatResponse {
     thinking?: string;
     tool_calls?: OllamaToolCall[];
   };
+
+  total_duration?: number;
+  load_duration?: number;
+  prompt_eval_count?: number;
+  prompt_eval_duration?: number;
+  eval_count?: number;
+  eval_duration?: number;
 }
 
 export class OllamaProvider implements ModelProvider {
@@ -47,6 +54,11 @@ export class OllamaProvider implements ModelProvider {
         messages,
         tools,
         stream: false,
+        think: false,
+        keep_alive: "10m",
+        options: {
+          num_predict: 128,
+        },
       }),
     });
 
@@ -69,6 +81,16 @@ export class OllamaProvider implements ModelProvider {
     const modelResponse: ModelResponse = {
       content: data.message.content ?? "",
       toolCalls,
+      metrics: {
+        totalDurationMs: Math.round((data.total_duration ?? 0) / 1_000_000),
+        loadDurationMs: Math.round((data.load_duration ?? 0) / 1_000_000),
+        promptEvalCount: data.prompt_eval_count ?? 0,
+        promptEvalDurationMs: Math.round(
+          (data.prompt_eval_duration ?? 0) / 1_000_000,
+        ),
+        evalCount: data.eval_count ?? 0,
+        evalDurationMs: Math.round((data.eval_duration ?? 0) / 1_000_000),
+      },
     };
 
     if (data.message.thinking !== undefined) {

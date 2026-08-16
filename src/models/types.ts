@@ -15,6 +15,14 @@ export interface ModelResponse {
   content: string;
   thinking?: string;
   toolCalls: ToolCall[];
+  metrics?: {
+    totalDurationMs: number;
+    loadDurationMs: number;
+    promptEvalCount: number;
+    promptEvalDurationMs: number;
+    evalCount: number;
+    evalDurationMs: number;
+  };
 }
 
 export interface ToolDefinition {
