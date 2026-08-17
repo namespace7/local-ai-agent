@@ -52,22 +52,43 @@ export class AgentToolExecutor {
       };
     }
 
-    executedToolCalls.add(toolCallKey);
-
     const tool = this.tools.get(toolCall.name);
     const toolStartedAt = Date.now();
 
     try {
       const result = await tool.execute(toolCall.arguments);
 
+      // Mark call as executed (except run_command, which must be re-executable after repairs)
+      if (toolCall.name !== "run_command") {
+        executedToolCalls.add(toolCallKey);
+      }
+
       console.log("[tool-result]", JSON.stringify(result, null, 2));
+
+      let traceSuccess = true;
+      let traceError: string | undefined;
+
+      if (
+        toolCall.name === "run_command" &&
+        result !== null &&
+        typeof result === "object"
+      ) {
+        const cmdResult = result as Record<string, unknown>;
+        if (typeof cmdResult.success === "boolean") {
+          traceSuccess = cmdResult.success;
+          if (!traceSuccess && typeof cmdResult.stderr === "string") {
+            traceError = cmdResult.stderr;
+          }
+        }
+      }
 
       this.trace.add({
         type: "tool",
         iteration,
         toolName: toolCall.name,
         durationMs: Date.now() - toolStartedAt,
-        success: true,
+        success: traceSuccess,
+        ...(traceError !== undefined ? { error: traceError } : {}),
       });
 
       return {

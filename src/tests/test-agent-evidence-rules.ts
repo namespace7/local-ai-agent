@@ -5,10 +5,10 @@ import { ToolRegistry } from "../tools/ToolRegistry.js";
 import { ReadFileTool } from "../tools/ReadFileTool.js";
 import { SearchFilesTool } from "../tools/SearchFilesTool.js";
 import { ListDirectoryTool } from "../tools/ListDirectoryTool.js";
+import { WriteFileTool } from "../tools/WriteFileTool.js";
+import { RunCommandTool } from "../tools/RunCommandTool.js";
 import { Workspace } from "../workspace/Workspace.js";
 import { FakeModelProvider } from "./fakes/FakeModelProvider.js";
-
-import { WriteFileTool } from "../tools/WriteFileTool.js";
 import type { Message } from "../models/types.js";
 
 const workspace = new Workspace(".");
@@ -18,6 +18,7 @@ tools.register(new SearchFilesTool(workspace));
 tools.register(new ListDirectoryTool(workspace));
 tools.register(new ReadFileTool(workspace));
 tools.register(new WriteFileTool(workspace));
+tools.register(new RunCommandTool(workspace));
 
 const trace = new ExecutionTrace();
 const memory = new ProjectMemory("./data/project-memory.json");
@@ -26,10 +27,7 @@ const capturedSystemPrompts: string[] = [];
 
 // A custom fake model provider that records system prompts
 class PromptRecordingFakeModel extends FakeModelProvider {
-  override async generate(
-    messages: Message[],
-    toolsDef: any,
-  ) {
+  override async generate(messages: Message[], toolsDef: any) {
     const systemMessage = messages.find((m) => m.role === "system");
     if (systemMessage) {
       capturedSystemPrompts.push(systemMessage.content);
@@ -118,20 +116,33 @@ const model = new PromptRecordingFakeModel([
       },
     ],
   },
-  // Iteration 6: read_file src/new-feature.ts to verify
+  // Iteration 6: run_command to verify typecheck
   {
     content: "",
     toolCalls: [
       {
-        id: "read-4",
-        name: "read_file",
+        id: "cmd-1",
+        name: "run_command",
         arguments: {
-          path: "src/new-feature.ts",
+          command: "npm run typecheck",
         },
       },
     ],
   },
-  // Iteration 7: Finish
+  // Iteration 7: run_command to verify test
+  {
+    content: "",
+    toolCalls: [
+      {
+        id: "cmd-2",
+        name: "run_command",
+        arguments: {
+          command: "node --test --version",
+        },
+      },
+    ],
+  },
+  // Iteration 8: Finish
   {
     content: "Feature implemented and verified.",
     toolCalls: [],
