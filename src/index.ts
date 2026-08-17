@@ -13,6 +13,8 @@ import { ExecutionTrace } from "./observability/ExecutionTrace.js";
 import { ProjectMemory } from "./memory/ProjectMemory.js";
 import { RememberTool } from "./memory/RememberTool.js";
 import { SearchFilesTool } from "./tools/SearchFilesTool.js";
+import { WriteFileTool } from "./tools/WriteFileTool.js";
+import { RunCommandTool } from "./tools/RunCommandTool.js";
 
 async function main(): Promise<void> {
   const prompt = process.argv.slice(2).join(" ");
@@ -33,6 +35,8 @@ async function main(): Promise<void> {
   tools.register(new ListDirectoryTool(workspace));
   tools.register(new ReadFileTool(workspace));
   tools.register(new SearchFilesTool(workspace));
+  tools.register(new WriteFileTool(workspace));
+  tools.register(new RunCommandTool(workspace));
   tools.register(new BrowserNavigateTool(browser));
   tools.register(new BrowserSnapshotTool(browser));
   tools.register(new BrowserFillTool(browser));
@@ -46,7 +50,9 @@ async function main(): Promise<void> {
   await memory.load();
 
 
-  const agent = new Agent(model, tools, trace, memory);
+  const agent = new Agent(model, tools, trace, memory, {
+    workspaceRoot: workspace.root,
+  });
 
   console.log("Thinking...\n");
 

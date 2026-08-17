@@ -1,3 +1,5 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ModelProvider } from "../models/ModelProvider.js";
 import type { Message } from "../models/types.js";
 import type { ToolRegistry } from "../tools/ToolRegistry.js";
@@ -28,12 +30,20 @@ interface SearchFilesResult {
   truncated: boolean;
 }
 
+export interface AgentOptions {
+  /** Override the default per-task-type maxIterations ceiling. */
+  maxIterations?: number;
+  /** Explicit workspace root directory for path normalization. Defaults to process.cwd(). */
+  workspaceRoot?: string;
+}
+
 export class Agent {
   constructor(
     private readonly model: ModelProvider,
     private readonly tools: ToolRegistry,
     private readonly trace: ExecutionTrace,
     private readonly memory: ProjectMemory,
+    private readonly options: AgentOptions = {},
   ) {}
 
   async run(prompt: string): Promise<string> {
@@ -62,7 +72,7 @@ export class Agent {
 
     const taskType = investigation.getTaskType();
 
-    const maxIterations =
+    const defaultMaxIterations =
       taskType === "implementation"
         ? 20
         : taskType === "implementation-plan"
@@ -70,13 +80,17 @@ export class Agent {
           : taskType === "existing-feature"
             ? 8
             : 6;
+    const maxIterations = this.options.maxIterations ?? defaultMaxIterations;
 
     const executedToolCalls = new Set<string>();
     const toolExecutor = new AgentToolExecutor(this.tools, this.trace);
 
     let implementationPhaseStarted = false;
+    let progressIterations = 0;
+    let consecutiveRejectedCalls = 0;
+    const maxConsecutiveRejectedCalls = 5;
 
-    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    while (progressIterations < maxIterations) {
       /*
        * Refresh the system prompt before every model call.
        *
@@ -112,7 +126,7 @@ export class Agent {
 
       this.trace.add({
         type: "model",
-        iteration,
+        iteration: progressIterations,
         durationMs: Date.now() - modelStartedAt,
         toolCallCount: response.toolCalls.length,
       });
@@ -149,6 +163,8 @@ export class Agent {
          * Do not execute tool calls returned by the investigation response.
          * The next model call receives the explicit implementation instruction.
          */
+        progressIterations += 1;
+        consecutiveRejectedCalls = 0;
         continue;
       }
 
@@ -206,6 +222,8 @@ After writing files, inspect the created or modified files to verify the result.
 Do not provide a final response yet.`,
           });
 
+          progressIterations += 1;
+          consecutiveRejectedCalls = 0;
           continue;
         }
 
@@ -223,12 +241,16 @@ Do not provide the final answer yet.
 Continue investigating the repository using the available tools. Choose a tool call that obtains one of the missing evidence categories.`,
         });
 
+        progressIterations += 1;
+        consecutiveRejectedCalls = 0;
         continue;
       }
 
       /*
        * Process each tool call returned by the model.
        */
+      let anyToolAccepted = false;
+
       for (const toolCall of response.toolCalls) {
         /*
          * IMPLEMENTATION PHASE
@@ -260,6 +282,13 @@ Continue investigating the repository using the available tools. Choose a tool c
           );
 
           if (!implementationPolicy.allowed) {
+            consecutiveRejectedCalls += 1;
+            if (consecutiveRejectedCalls >= maxConsecutiveRejectedCalls) {
+              throw new Error(
+                `Agent exceeded maximum consecutive rejected tool calls (${maxConsecutiveRejectedCalls})`,
+              );
+            }
+
             messages.push({
               role: "tool",
               toolCallId: toolCall.id,
@@ -289,135 +318,69 @@ Continue implementing the requested feature.`,
             continue;
           }
 
-          const execution = await toolExecutor.execute(
-            toolCall,
-            iteration,
-            executedToolCalls,
-          );
-
-          messages.push(execution.message);
-
           /*
-           * Do not treat duplicate calls as new implementation work.
+           * REPAIR EVIDENCE GATE
+           *
+           * After a verification failure, the controller records which
+           * workspace files were named in the error output.  write_file is
+           * blocked until every such file has been read at least once since
+           * the failure.  This prevents the model from rewriting the wrong
+           * file (as in Run 12) without first inspecting the one that is
+           * actually broken.
+           *
+           * read_file, run_command, and search_files are always allowed.
            */
-          if (execution.duplicate) {
+          if (
+            toolCall.name === "write_file" &&
+            investigation.hasUnreadRepairEvidence()
+          ) {
+            const unreadPaths = investigation.getUnreadRepairPaths();
+
+            consecutiveRejectedCalls += 1;
+            if (consecutiveRejectedCalls >= maxConsecutiveRejectedCalls) {
+              throw new Error(
+                `Agent exceeded maximum consecutive rejected tool calls (${maxConsecutiveRejectedCalls})`,
+              );
+            }
+
+            const pathList = unreadPaths.map((p) => `  - ${p}`).join("\n");
+
+            messages.push({
+              role: "tool",
+              toolCallId: toolCall.id,
+              content: JSON.stringify({
+                success: false,
+                error:
+                  "write_file rejected: verification failed and implicated files have not been inspected.",
+              }),
+            });
+
             messages.push({
               role: "user",
-              content: `This exact tool call was already executed.
+              content: `REPAIR EVIDENCE REQUIRED
 
-${investigation.getContext()}
+Verification failed and the following file(s) have not been inspected since the failure:
 
-Do not repeat the same tool call.
+${pathList}
 
-Choose the next implementation or verification action.`,
+You must call read_file on each of these file(s) before making any repair write.
+
+Do not attempt write_file again until all listed files have been read.
+
+${investigation.getContext()}`,
             });
 
             continue;
           }
-
-          /*
-           * Record the successful implementation action.
-           */
-          investigation.recordToolCall(
-            toolCall.name,
-            this.createToolCallArgumentsKey(toolCall.arguments),
-          );
-
-          investigation.addObservation(
-            toolCall.name,
-            this.summarizeToolResult(execution.result),
-          );
-
-          this.recordInspectedPath(investigation, execution.result);
-
-          /*
-           * Track files created or modified by write_file.
-           */
-          if (
-            toolCall.name === "write_file" &&
-            execution.result !== undefined
-          ) {
-            const result = execution.result as {
-              path?: unknown;
-            };
-
-            if (typeof result.path === "string") {
-              investigation.recordWrittenFile(result.path);
-
-              console.log("[implementation-write]", result.path);
-            }
-          }
-
-          /*
-           * A read_file of a file written during this implementation
-           * counts as verification.
-           */
-          if (toolCall.name === "read_file") {
-            const path = toolCall.arguments.path;
-
-            if (typeof path === "string") {
-              investigation.recordInspectedFile(path);
-
-              const normalizedReadPath = this.normalizeWorkspacePath(path);
-
-              const implementationState =
-                investigation.getImplementationState();
-
-              const verifiedWrittenFile = implementationState.filesWritten.some(
-                (writtenPath) =>
-                  this.normalizeWorkspacePath(writtenPath) ===
-                  normalizedReadPath,
+        } else if (investigation.getTaskType() !== "factual") {
+          if (investigation.isComplete()) {
+            consecutiveRejectedCalls += 1;
+            if (consecutiveRejectedCalls >= maxConsecutiveRejectedCalls) {
+              throw new Error(
+                `Agent exceeded maximum consecutive rejected tool calls (${maxConsecutiveRejectedCalls})`,
               );
-
-              if (verifiedWrittenFile) {
-                investigation.markVerificationPerformed();
-
-                console.log("[implementation-verification]", path);
-              }
             }
-          }
 
-          console.log(
-            "[implementation-state]",
-            JSON.stringify(investigation.getImplementationState(), null, 2),
-          );
-
-          continue;
-        }
-
-        /*
-         * INVESTIGATION PHASE
-         *
-         * Non-factual tasks cannot use tools after their investigation
-         * evidence is complete.
-         */
-        if (
-          investigation.getTaskType() !== "factual" &&
-          investigation.isComplete()
-        ) {
-          if (investigation.getTaskType() === "implementation-plan") {
-            messages.push({
-              role: "user",
-              content: `The required repository investigation is now complete.
-
-${investigation.getContext()}
-
-Stop using investigation tools.
-
-Produce the final implementation plan now.
-
-Base the plan only on repository evidence already gathered.
-
-Clearly distinguish:
-
-1. Existing files that should change.
-2. New files that should be created.
-3. Files inspected only for evidence.
-4. The repository evidence supporting each proposed change.
-
-Do not investigate further.`,
-            });
-          } else {
             messages.push({
               role: "user",
               content: `The investigation is already complete.
@@ -428,92 +391,93 @@ Do not call another investigation tool.
 
 Produce the final answer using the evidence already collected.`,
             });
+
+            continue;
           }
 
-          continue;
+          const policy = this.validateInvestigationToolCall(
+            investigation,
+            toolCall.name,
+            toolCall.arguments,
+          );
+
+          console.log(
+            "[investigation-policy]",
+            JSON.stringify(
+              {
+                tool: toolCall.name,
+                arguments: toolCall.arguments,
+                allowed: policy.allowed,
+                reason: policy.reason,
+                taskType: investigation.getTaskType(),
+                evidence: investigation.getEvidence(),
+              },
+              null,
+              2,
+            ),
+          );
+
+          if (!policy.allowed) {
+            consecutiveRejectedCalls += 1;
+            if (consecutiveRejectedCalls >= maxConsecutiveRejectedCalls) {
+              throw new Error(
+                `Agent exceeded maximum consecutive rejected tool calls (${maxConsecutiveRejectedCalls})`,
+              );
+            }
+
+            messages.push({
+              role: "tool",
+              toolCallId: toolCall.id,
+              content: JSON.stringify({
+                success: false,
+                error: policy.reason,
+              }),
+            });
+
+            messages.push({
+              role: "user",
+              content: this.buildInvestigationRejectionPrompt(
+                toolCall.name,
+                policy.reason || "Tool call not permitted",
+                investigation,
+                prompt,
+              ),
+            });
+
+            continue;
+          }
         }
 
-        const policy = this.validateInvestigationToolCall(
-          investigation,
-          toolCall.name,
-          toolCall.arguments,
-        );
+        anyToolAccepted = true;
 
-        console.log(
-          "[investigation-policy]",
-          JSON.stringify(
-            {
-              tool: toolCall.name,
-              arguments: toolCall.arguments,
-              allowed: policy.allowed,
-              reason: policy.reason,
-              taskType: investigation.getTaskType(),
-              evidence: investigation.getEvidence(),
-            },
-            null,
-            2,
-          ),
-        );
-
-        /*
-         * Tool call rejected by investigation policy.
-         */
-        if (!policy.allowed) {
-          messages.push({
-            role: "tool",
-            toolCallId: toolCall.id,
-            content: JSON.stringify({
-              success: false,
-              error: policy.reason,
-            }),
-          });
-
-          messages.push({
-            role: "user",
-            content: `That tool call is not appropriate for the current investigation state.
-
-${investigation.getContext()}
-
-Choose a tool call that obtains one of the missing evidence categories.
-
-Do not repeat the rejected tool call.`,
-          });
-
-          continue;
-        }
-
-        /*
-         * Execute the investigation tool.
-         */
         const execution = await toolExecutor.execute(
           toolCall,
-          iteration,
+          progressIterations,
           executedToolCalls,
         );
 
         messages.push(execution.message);
 
+        /*
+         * Do not treat duplicate calls as new implementation work.
+         */
         if (execution.duplicate) {
           messages.push({
             role: "user",
-            content: `The requested tool call was already executed and was not run again.
-
-Do not repeat the same tool call.
-
-Current investigation state:
+            content: `This exact tool call was already executed.
 
 ${investigation.getContext()}
 
-Choose a different tool call that discovers new information.
+Do not repeat the same tool call.
 
-Continue investigating. Do not provide the final answer until the required evidence is complete.`,
+Choose the next implementation or verification action.`,
           });
 
           continue;
         }
 
         /*
-         * Record successful investigation activity.
+         * Record the successful implementation action.
          */
         investigation.recordToolCall(
           toolCall.name,
@@ -526,6 +490,120 @@ Continue investigating. Do not provide the final answer until the required evide
         );
 
         this.recordInspectedPath(investigation, execution.result);
+
+        /*
+         * Satisfy repair evidence when the model reads a path that was
+         * implicated in the last verification failure.
+         */
+        if (
+          toolCall.name === "read_file" &&
+          typeof toolCall.arguments?.path === "string"
+        ) {
+          investigation.satisfyRepairPath(toolCall.arguments.path as string);
+        }
+
+        /*
+         * Track files created or modified by write_file.
+         */
+        if (
+          toolCall.name === "write_file" &&
+          execution.result !== undefined
+        ) {
+          const result = execution.result as {
+            path?: unknown;
+          };
+
+          if (typeof result.path === "string") {
+            const content =
+              typeof toolCall.arguments?.content === "string"
+                ? toolCall.arguments.content
+                : undefined;
+            investigation.recordWrittenFile(result.path, content);
+
+            console.log("[implementation-write]", result.path);
+          }
+        }
+
+        if (toolCall.name === "run_command") {
+          const commandResult = execution.result as {
+            command?: string;
+            exitCode?: number;
+            stdout?: string;
+            stderr?: string;
+            success?: boolean;
+          };
+
+          const isSuccess = Boolean(commandResult?.success);
+          const commandName = commandResult?.command || "run_command";
+          investigation.recordVerificationResult(commandName, isSuccess);
+
+          const category = investigation.classifyCommand(commandName);
+
+          if (isSuccess) {
+            console.log("[implementation-verification]", commandName, "PASSED");
+
+            /*
+             * Successful verification clears all repair-evidence requirements.
+             * The failure that prompted the repair cycle is now resolved.
+             */
+            investigation.clearRepairEvidence();
+
+            if (
+              category === "test" &&
+              !investigation.getImplementationState().completedCategories.includes("test")
+            ) {
+              messages.push({
+                role: "user",
+                content: `The test command '${commandName}' passed with exit code 0, but test verification is not yet satisfied because there is no valid test evidence linked to the implementation. Inspect or write a test file (e.g. in src/tests/) that imports or references your implementation, then rerun the test command.`,
+              });
+            }
+          } else {
+            console.log("[implementation-verification]", commandName, "FAILED");
+
+            messages.push({
+              role: "user",
+              content: `Verification command '${commandName}' failed with exit code ${commandResult?.exitCode ?? 1}.
+
+Stdout:
+${commandResult?.stdout || "(none)"}
+
+Stderr:
+${commandResult?.stderr || "(none)"}
+
+Repair instructions:
+1. Repair the specific reported errors above using write_file. Make the smallest targeted repair possible rather than redesigning the project.
+2. Preserve existing project configuration discovered during investigation (package.json scripts, test framework, dependencies, TypeScript/module settings).
+3. Do NOT switch test frameworks during repair (e.g. if the project uses node:test, continue using node:test).
+4. Do NOT create duplicate source files with a different extension to work around an error.
+5. Inspect the relevant configuration or error before modifying configuration files.
+6. After repairing, rerun the SAME failed verification command '${commandName}'. Successful verification is required before completion.`,
+            });
+
+            /*
+             * Extract workspace-relative paths from the failure output that
+             * correspond to existing files in the workspace.
+             * The model must read each before it is allowed to write again.
+             */
+            const workspaceRoot = this.getWorkspaceRoot();
+            const implicatedPaths = this.extractImplicatedPaths(
+              commandResult?.stdout ?? "",
+              commandResult?.stderr ?? "",
+              workspaceRoot,
+            );
+            investigation.recordVerificationFailurePaths(implicatedPaths);
+            if (implicatedPaths.length > 0) {
+              console.log(
+                "[repair-evidence] implicated paths:",
+                implicatedPaths,
+              );
+            }
+          }
+        }
+
+        console.log(
+          "[implementation-state]",
+          JSON.stringify(investigation.getImplementationState(), null, 2),
+        );
 
         this.updateInvestigationEvidence(
           investigation,
@@ -589,7 +667,8 @@ Do not investigate further.`,
          */
         if (
           investigation.getTaskType() === "implementation" &&
-          investigation.isComplete()
+          investigation.isComplete() &&
+          !implementationPhaseStarted
         ) {
           implementationPhaseStarted = true;
           investigation.startImplementation();
@@ -605,9 +684,84 @@ Do not investigate further.`,
           break;
         }
       }
+
+      if (anyToolAccepted) {
+        progressIterations += 1;
+        consecutiveRejectedCalls = 0;
+      }
     }
 
     throw new Error(`Agent exceeded maximum iterations (${maxIterations})`);
+  }
+
+  private buildInvestigationRejectionPrompt(
+    toolName: string,
+    policyReason: string,
+    investigation: InvestigationState,
+    prompt: string,
+  ): string {
+    const evidence = investigation.getEvidence();
+
+    if (!evidence.featureSearchCompleted) {
+      const suggestedQuery = this.extractSearchQueryFromPrompt(prompt);
+
+      return `REJECTED TOOL CALL: ${toolName} is not allowed yet.
+
+Reason:
+${policyReason}
+
+REQUIRED NEXT ACTION:
+You MUST call search_files now.
+Use the requested feature/concept as the search query.
+For this task, use:
+search_files({"query":"${suggestedQuery}"})
+
+Do NOT call list_directory or read_file until search_files has executed.
+
+${investigation.getContext()}`;
+    }
+
+    return `REJECTED TOOL CALL: ${toolName} is not allowed at this step.
+
+Reason:
+${policyReason}
+
+${investigation.getContext()}
+
+Choose a tool call that obtains one of the missing evidence categories.
+
+Do not repeat the rejected tool call.`;
+  }
+
+  private extractSearchQueryFromPrompt(prompt: string): string {
+    const words = prompt
+      .split(/\s+/)
+      .map((w) => w.replace(/[^a-zA-Z0-9_-]/g, ""))
+      .filter(
+        (w) =>
+          w.length > 2 &&
+          ![
+            "build",
+            "create",
+            "add",
+            "implement",
+            "make",
+            "simple",
+            "new",
+            "this",
+            "that",
+            "with",
+            "from",
+            "your",
+            "workspace",
+            "repository",
+            "application",
+            "app",
+            "feature",
+          ].includes(w.toLowerCase()),
+      );
+
+    return words[0] || prompt.trim();
   }
 
   private buildImplementationTransitionPrompt(
@@ -637,12 +791,13 @@ Implementation rules:
 3. Do not overwrite unrelated files.
 4. Create the smallest coherent implementation that satisfies the request.
 5. Use write_file for actual file creation or modification.
-6. After writing files, use read_file to inspect and verify the files you created or modified.
-7. Use search_files only when needed to verify integration points or references.
-8. If tests already exist for the relevant behavior, follow their conventions.
-9. Do not stop after describing what you would do.
-10. Continue using tools until the requested implementation is actually present.
-11. Only provide the final response after the implementation has been completed and verified.
+6. Use read_file only for file inspection. Reading files does NOT verify implementation.
+7. Execute actual project verification using run_command (e.g. 'npx tsc --noEmit', 'npm run typecheck', or 'npm test').
+8. Writing or modifying files invalidates any previous verification result.
+9. If verification fails, inspect the stdout/stderr output and use write_file to repair the implementation.
+10. Do not stop after describing what you would do.
+11. Continue using tools until a verification command succeeds after the latest write.
+12. Only provide the final response after verification has succeeded on the latest code.
 
 Begin implementation now.`;
   }
@@ -660,7 +815,8 @@ Begin implementation now.`;
     if (
       toolName === "write_file" ||
       toolName === "read_file" ||
-      toolName === "search_files"
+      toolName === "search_files" ||
+      toolName === "run_command"
     ) {
       return {
         allowed: true,
@@ -670,7 +826,7 @@ Begin implementation now.`;
     return {
       allowed: false,
       reason:
-        "Implementation phase is active. Do not perform broad repository exploration. Use write_file, read_file, or search_files for implementation and verification.",
+        "Implementation phase is active. Do not perform broad repository exploration. Use write_file, read_file, search_files, or run_command for implementation and verification.",
     };
   }
 
@@ -953,11 +1109,33 @@ Begin implementation now.`;
 
       if (this.isConfigurationPath(path)) {
         investigation.markConfigurationInspected();
+
+        const lowerPath = path.toLowerCase();
+        if (lowerPath.endsWith("tsconfig.json")) {
+          investigation.addRequiredCategory("typecheck");
+        }
+
+        if (lowerPath.endsWith("package.json")) {
+          const content =
+            result !== null &&
+            typeof result === "object" &&
+            typeof (result as any).content === "string"
+              ? ((result as any).content as string)
+              : "";
+
+          if (content.includes("tsconfig.json") || content.includes('"typecheck"')) {
+            investigation.addRequiredCategory("typecheck");
+          }
+          if (content.includes('"test"')) {
+            investigation.addRequiredCategory("test");
+          }
+        }
         return;
       }
 
       if (this.isTestPath(normalizedPath)) {
         investigation.markTestsInspected();
+        investigation.addRequiredCategory("test");
         return;
       }
 
@@ -1010,6 +1188,110 @@ Begin implementation now.`;
 
   private normalizeWorkspacePath(path: string): string {
     return path.replace(/^.\//, "");
+  }
+
+  /**
+   * Retrieve the active workspace root directory from AgentOptions.
+   * Defaults to process.cwd().
+   */
+  private getWorkspaceRoot(): string {
+    return this.options.workspaceRoot
+      ? path.resolve(this.options.workspaceRoot)
+      : process.cwd();
+  }
+
+  /**
+   * Extract workspace-relative file paths implicated by a verification failure.
+   *
+   * Strategy:
+   * 1. Scan stdout + stderr for path-like tokens (containing slashes).
+   * 2. Strip surrounding punctuation, line/col numbers, and prefixes.
+   * 3. Normalize each candidate to a workspace-relative path.
+   * 4. Verify that candidate resolves inside the workspace (not escaping root).
+   * 5. Filter out external/runtime paths (node_modules, .git, node:).
+   * 6. Check that the file actually exists on disk (fs.existsSync & isFile).
+   *    Non-existent paths (e.g. missing modules) are ignored so no deadlock occurs.
+   *    Existing pre-existing files or newly written files are captured.
+   */
+  private extractImplicatedPaths(
+    stdout: string,
+    stderr: string,
+    workspaceRoot: string = process.cwd(),
+  ): string[] {
+    const combined = `${stdout}\n${stderr}`;
+    if (!combined.trim()) {
+      return [];
+    }
+
+    const resolvedRoot = path.resolve(workspaceRoot);
+
+    // Extract potential path tokens: sequences containing at least one slash
+    const rawTokens = combined.match(/[^\s"'`()[\]{}<>|&;,]+/g) ?? [];
+
+    const implicated = new Set<string>();
+
+    for (let raw of rawTokens) {
+      if (raw.startsWith("file://")) {
+        raw = raw.slice(7);
+      }
+
+      // Strip line/column suffixes, e.g. :12:5 or :12 or ,12
+      let candidate = raw.replace(/:\d+(?::\d+)?$/, "").replace(/,\d+$/, "");
+
+      // Strip leading and trailing punctuation
+      candidate = candidate.replace(/^[.,;:]+/, "").replace(/[.,;:]+$/, "");
+
+      if (!candidate || !candidate.includes("/")) {
+        continue;
+      }
+
+      // Ignore node_modules, .git, and Node internal modules
+      if (
+        candidate.includes("node_modules") ||
+        candidate.includes(".git") ||
+        candidate.startsWith("node:")
+      ) {
+        continue;
+      }
+
+      try {
+        let absPath: string;
+        let relPath: string;
+
+        if (path.isAbsolute(candidate)) {
+          absPath = path.resolve(candidate);
+          relPath = path.relative(resolvedRoot, absPath);
+        } else {
+          const cleanRel = candidate.replace(/^\.\//, "");
+          absPath = path.resolve(resolvedRoot, cleanRel);
+          relPath = path.relative(resolvedRoot, absPath);
+        }
+
+        // Must resolve inside the workspace boundaries
+        if (relPath.startsWith("..") || path.isAbsolute(relPath)) {
+          continue;
+        }
+
+        // Normalize relative path with forward slashes
+        const normalizedRelPath = relPath.split(path.sep).join("/");
+
+        if (!normalizedRelPath || normalizedRelPath === ".") {
+          continue;
+        }
+
+        // Must exist on disk as a file
+        if (fs.existsSync(absPath)) {
+          const stat = fs.statSync(absPath);
+          if (stat.isFile()) {
+            implicated.add(normalizedRelPath);
+          }
+        }
+      } catch {
+        // Ignore resolution or stat errors
+      }
+    }
+
+    return [...implicated];
   }
 
   private createToolCallArgumentsKey(
@@ -1189,12 +1471,11 @@ PHASE 3 — VERIFICATION
 
 After writing:
 
-- Inspect the files you created or changed.
-- Use read_file to verify the files you created or modified.
-- Use search_files only when needed to verify integration points or references.
-- Check that imports, paths, and integration points are consistent.
-- If appropriate tests are available, follow their conventions.
-- Do not claim success merely because write_file succeeded.
+- Use read_file to inspect created or modified files. Read_file does NOT mark verification complete.
+- Use run_command to execute project verification (e.g., 'npx tsc --noEmit', 'npm run typecheck', or 'npm test').
+- Any write_file operation invalidates previous verification results.
+- If run_command fails, review the stdout/stderr error details and use write_file to repair the code.
+- Do not claim implementation success until a verification command succeeds after the latest write.
 
 Investigation progress:
 
