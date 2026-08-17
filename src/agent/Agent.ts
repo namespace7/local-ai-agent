@@ -60,20 +60,29 @@ export class Agent {
       },
     ];
 
+    const taskType = investigation.getTaskType();
+
     const maxIterations =
-      investigation.getTaskType() === "implementation-plan"
-        ? 12
-        : investigation.getTaskType() === "existing-feature"
-          ? 8
-          : 6;
+      taskType === "implementation"
+        ? 20
+        : taskType === "implementation-plan"
+          ? 12
+          : taskType === "existing-feature"
+            ? 8
+            : 6;
 
     const executedToolCalls = new Set<string>();
     const toolExecutor = new AgentToolExecutor(this.tools, this.trace);
 
+    let implementationPhaseStarted = false;
+
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       /*
-       * Refresh the system prompt before every model call so the model
-       * always sees the latest investigation evidence and inspected paths.
+       * Refresh the system prompt before every model call.
+       *
+       * This is especially important during implementation because the
+       * model needs to see the current investigation state and know when
+       * it is allowed to use write_file.
        */
       messages[0] = {
         role: "system",
@@ -115,17 +124,94 @@ export class Agent {
       });
 
       /*
-       * If the model wants to answer without using a tool, only allow that
-       * when the investigation has enough evidence for the task type.
+       * IMPLEMENTATION TRANSITION
+       *
+       * Once all investigation evidence is available, implementation tasks
+       * leave investigation mode and enter the writing phase.
+       */
+      if (
+        investigation.getTaskType() === "implementation" &&
+        investigation.isComplete() &&
+        !implementationPhaseStarted
+      ) {
+        implementationPhaseStarted = true;
+        investigation.startImplementation();
+
+        messages.push({
+          role: "user",
+          content: this.buildImplementationTransitionPrompt(
+            prompt,
+            investigation,
+          ),
+        });
+
+        /*
+         * Do not execute tool calls returned by the investigation response.
+         * The next model call receives the explicit implementation instruction.
+         */
+        continue;
+      }
+
+      /*
+       * A model response without tool calls can be final only when:
+       *
+       * - factual question: model has answered
+       * - existing-feature: enough evidence exists
+       * - implementation-plan: investigation is complete
+       * - implementation: implementation has been verified
        */
       if (response.toolCalls.length === 0) {
+        if (investigation.getTaskType() === "factual") {
+          return response.content;
+        }
+
         if (
-          investigation.getTaskType() !== "factual" &&
+          investigation.getTaskType() === "existing-feature" &&
           investigation.isComplete()
         ) {
           return response.content;
         }
 
+        if (
+          investigation.getTaskType() === "implementation-plan" &&
+          investigation.isComplete()
+        ) {
+          return response.content;
+        }
+
+        /*
+         * Implementation has started, but the model returned text without
+         * actually completing the implementation.
+         */
+        if (
+          investigation.getTaskType() === "implementation" &&
+          implementationPhaseStarted
+        ) {
+          if (investigation.isImplementationComplete()) {
+            return response.content;
+          }
+
+          messages.push({
+            role: "user",
+            content: `Implementation is not complete yet.
+
+${investigation.getContext()}
+
+You must continue implementing the requested feature.
+
+Use write_file to create or modify the required files.
+
+After writing files, inspect the created or modified files to verify the result.
+
+Do not provide a final response yet.`,
+          });
+
+          continue;
+        }
+
+        /*
+         * Non-implementation investigation tasks still need more evidence.
+         */
         messages.push({
           role: "user",
           content: `The investigation is not complete yet.
@@ -140,39 +226,213 @@ Continue investigating the repository using the available tools. Choose a tool c
         continue;
       }
 
+      /*
+       * Process each tool call returned by the model.
+       */
       for (const toolCall of response.toolCalls) {
         /*
-         * Once a non-factual investigation is complete, the model should not
-         * make additional repository calls.
+         * IMPLEMENTATION PHASE
          *
-         * Factual questions are different: they may be considered "complete"
-         * before the first tool call because their investigation state does not
-         * require evidence categories. The tool call itself still needs to run
-         * so that extractDirectAnswer() can derive the answer from the result.
+         * Once implementation has started, tools must actually execute.
+         *
+         * Runtime policy is enforced here rather than relying only on the
+         * model's system prompt.
          */
         if (
-          investigation.getTaskType() !== "factual" &&
-          investigation.isComplete()
+          investigation.getTaskType() === "implementation" &&
+          implementationPhaseStarted
         ) {
-          messages.push({
-            role: "user",
-            content: `The investigation is already complete.
+          const implementationPolicy = this.validateImplementationToolCall(
+            toolCall.name,
+          );
 
-            ${investigation.getContext()}
+          console.log(
+            "[implementation-policy]",
+            JSON.stringify(
+              {
+                tool: toolCall.name,
+                allowed: implementationPolicy.allowed,
+                reason: implementationPolicy.reason,
+              },
+              null,
+              2,
+            ),
+          );
 
-            Do not call another tool. Produce the final answer using the evidence already collected.`,
-          });
+          if (!implementationPolicy.allowed) {
+            messages.push({
+              role: "tool",
+              toolCallId: toolCall.id,
+              content: JSON.stringify({
+                success: false,
+                error: implementationPolicy.reason,
+              }),
+            });
+
+            messages.push({
+              role: "user",
+              content: `That tool is not allowed during the implementation phase.
+
+${investigation.getContext()}
+
+Use write_file to implement the requested change.
+
+Use read_file to inspect files you created or modified.
+
+Use search_files only when needed to verify integration points or references.
+
+Do not perform broad repository exploration.
+
+Continue implementing the requested feature.`,
+            });
+
+            continue;
+          }
+
+          const execution = await toolExecutor.execute(
+            toolCall,
+            iteration,
+            executedToolCalls,
+          );
+
+          messages.push(execution.message);
+
+          /*
+           * Do not treat duplicate calls as new implementation work.
+           */
+          if (execution.duplicate) {
+            messages.push({
+              role: "user",
+              content: `This exact tool call was already executed.
+
+${investigation.getContext()}
+
+Do not repeat the same tool call.
+
+Choose the next implementation or verification action.`,
+            });
+
+            continue;
+          }
+
+          /*
+           * Record the successful implementation action.
+           */
+          investigation.recordToolCall(
+            toolCall.name,
+            this.createToolCallArgumentsKey(toolCall.arguments),
+          );
+
+          investigation.addObservation(
+            toolCall.name,
+            this.summarizeToolResult(execution.result),
+          );
+
+          this.recordInspectedPath(investigation, execution.result);
+
+          /*
+           * Track files created or modified by write_file.
+           */
+          if (
+            toolCall.name === "write_file" &&
+            execution.result !== undefined
+          ) {
+            const result = execution.result as {
+              path?: unknown;
+            };
+
+            if (typeof result.path === "string") {
+              investigation.recordWrittenFile(result.path);
+
+              console.log("[implementation-write]", result.path);
+            }
+          }
+
+          /*
+           * A read_file of a file written during this implementation
+           * counts as verification.
+           */
+          if (toolCall.name === "read_file") {
+            const path = toolCall.arguments.path;
+
+            if (typeof path === "string") {
+              investigation.recordInspectedFile(path);
+
+              const normalizedReadPath = this.normalizeWorkspacePath(path);
+
+              const implementationState =
+                investigation.getImplementationState();
+
+              const verifiedWrittenFile = implementationState.filesWritten.some(
+                (writtenPath) =>
+                  this.normalizeWorkspacePath(writtenPath) ===
+                  normalizedReadPath,
+              );
+
+              if (verifiedWrittenFile) {
+                investigation.markVerificationPerformed();
+
+                console.log("[implementation-verification]", path);
+              }
+            }
+          }
+
+          console.log(
+            "[implementation-state]",
+            JSON.stringify(investigation.getImplementationState(), null, 2),
+          );
 
           continue;
         }
 
         /*
-         * Enforce investigation strategy at the application level.
+         * INVESTIGATION PHASE
          *
-         * The model is responsible for choosing the exact path/query,
-         * but the application controls whether that category of action
-         * is appropriate for the current investigation state.
+         * Non-factual tasks cannot use tools after their investigation
+         * evidence is complete.
          */
+        if (
+          investigation.getTaskType() !== "factual" &&
+          investigation.isComplete()
+        ) {
+          if (investigation.getTaskType() === "implementation-plan") {
+            messages.push({
+              role: "user",
+              content: `The required repository investigation is now complete.
+
+${investigation.getContext()}
+
+Stop using investigation tools.
+
+Produce the final implementation plan now.
+
+Base the plan only on repository evidence already gathered.
+
+Clearly distinguish:
+
+1. Existing files that should change.
+2. New files that should be created.
+3. Files inspected only for evidence.
+4. The repository evidence supporting each proposed change.
+
+Do not investigate further.`,
+            });
+          } else {
+            messages.push({
+              role: "user",
+              content: `The investigation is already complete.
+
+${investigation.getContext()}
+
+Do not call another investigation tool.
+
+Produce the final answer using the evidence already collected.`,
+            });
+          }
+
+          continue;
+        }
+
         const policy = this.validateInvestigationToolCall(
           investigation,
           toolCall.name,
@@ -195,102 +455,10 @@ Continue investigating the repository using the available tools. Choose a tool c
           ),
         );
 
+        /*
+         * Tool call rejected by investigation policy.
+         */
         if (!policy.allowed) {
-          console.log(
-            "[investigation-recovery]",
-            JSON.stringify(
-              {
-                rejectedTool: toolCall.name,
-                rejectedArguments: toolCall.arguments,
-                reason: policy.reason,
-                evidence: investigation.getEvidence(),
-              },
-              null,
-              2,
-            ),
-          );
-
-          const requiredTool = this.getRequiredInvestigationTool(investigation);
-
-          /*
-           * For implementation-plan tasks, the application owns the minimum
-           * investigation sequence. If the model chooses an invalid action,
-           * deterministically execute the next required evidence-gathering action
-           * instead of asking the model to retry the same decision.
-           */
-          if (requiredTool !== undefined) {
-            const recoveryToolCall = {
-              id: `recovery-${iteration}`,
-              name: requiredTool.name,
-              arguments: requiredTool.arguments,
-            } as typeof toolCall;
-
-            console.log(
-              "[investigation-recovery]",
-              JSON.stringify(
-                {
-                  tool: recoveryToolCall.name,
-                  arguments: recoveryToolCall.arguments,
-                },
-                null,
-                2,
-              ),
-            );
-
-            const recoveryExecution = await toolExecutor.execute(
-              recoveryToolCall,
-              iteration,
-              executedToolCalls,
-            );
-
-            messages.push(recoveryExecution.message);
-
-            /*
-             * A recovery action should always be new. If this happens to be a
-             * duplicate, do not allow the agent to silently spin.
-             */
-            if (recoveryExecution.duplicate) {
-              throw new Error(
-                `Investigation recovery attempted duplicate tool call: ${recoveryToolCall.name}`,
-              );
-            }
-
-            /*
-             * Record the recovery action exactly like a normal model-selected
-             * investigation action.
-             */
-            investigation.recordToolCall(
-              recoveryToolCall.name,
-              this.createToolCallArgumentsKey(recoveryToolCall.arguments),
-            );
-
-            investigation.addObservation(
-              recoveryToolCall.name,
-              this.summarizeToolResult(recoveryExecution.result),
-            );
-
-            this.recordInspectedPath(investigation, recoveryExecution.result);
-
-            this.updateInvestigationEvidence(
-              investigation,
-              recoveryToolCall.name,
-              recoveryToolCall.arguments,
-              recoveryExecution.result,
-            );
-
-            /*
-             * The recovery action has changed the investigation state.
-             *
-             * Do not let the current model response issue additional calls based
-             * on the stale state it generated before recovery.
-             */
-            break;
-          }
-
-          /*
-           * If there is no deterministic recovery action, fall back to the
-           * existing model-guidance behavior.
-           */
           messages.push({
             role: "tool",
             toolCallId: toolCall.id,
@@ -311,9 +479,12 @@ Choose a tool call that obtains one of the missing evidence categories.
 Do not repeat the rejected tool call.`,
           });
 
-          break;
+          continue;
         }
 
+        /*
+         * Execute the investigation tool.
+         */
         const execution = await toolExecutor.execute(
           toolCall,
           iteration,
@@ -322,10 +493,6 @@ Do not repeat the rejected tool call.`,
 
         messages.push(execution.message);
 
-        /*
-         * Duplicate tool calls are a recovery condition, not a normal
-         * investigation step.
-         */
         if (execution.duplicate) {
           messages.push({
             role: "user",
@@ -339,13 +506,6 @@ ${investigation.getContext()}
 
 Choose a different tool call that discovers new information.
 
-For implementation-planning tasks, prioritize the missing evidence categories:
-
-- project configuration
-- representative implementation
-- relevant tests
-- extension points
-
 Continue investigating. Do not provide the final answer until the required evidence is complete.`,
           });
 
@@ -353,7 +513,7 @@ Continue investigating. Do not provide the final answer until the required evide
         }
 
         /*
-         * Record successful tool execution in the investigation state.
+         * Record successful investigation activity.
          */
         investigation.recordToolCall(
           toolCall.name,
@@ -376,13 +536,6 @@ Continue investigating. Do not provide the final answer until the required evide
 
         /*
          * Preserve the optimized factual-answer path.
-         *
-         * For questions such as:
-         * "What port does the browser fixture use?"
-         *
-         * search_files -> deterministic extraction -> answer
-         *
-         * without another model inference.
          */
         const directAnswer = this.extractDirectAnswer(
           prompt,
@@ -395,11 +548,8 @@ Continue investigating. Do not provide the final answer until the required evide
         }
 
         /*
-         * IMPORTANT:
-         *
-         * Once the final required evidence category has been collected,
-         * explicitly transition the conversation from investigation mode
-         * into answer mode.
+         * Planning transition happens immediately after the final evidence
+         * category is collected.
          */
         if (
           investigation.getTaskType() === "implementation-plan" &&
@@ -427,13 +577,31 @@ Clearly distinguish:
 Do not investigate further.`,
           });
 
-          /*
-           * Break out of the current tool-call batch.
-           *
-           * Some models may return multiple tool calls in one response.
-           * Once investigation is complete, executing the remaining calls
-           * would be unnecessary and could cause another investigation loop.
-           */
+          break;
+        }
+
+        /*
+         * Implementation transition.
+         *
+         * Do not let remaining tool calls from the investigation response
+         * execute. The next model invocation receives the implementation
+         * instruction.
+         */
+        if (
+          investigation.getTaskType() === "implementation" &&
+          investigation.isComplete()
+        ) {
+          implementationPhaseStarted = true;
+          investigation.startImplementation();
+
+          messages.push({
+            role: "user",
+            content: this.buildImplementationTransitionPrompt(
+              prompt,
+              investigation,
+            ),
+          });
+
           break;
         }
       }
@@ -442,23 +610,73 @@ Do not investigate further.`,
     throw new Error(`Agent exceeded maximum iterations (${maxIterations})`);
   }
 
+  private buildImplementationTransitionPrompt(
+    prompt: string,
+    investigation: InvestigationState,
+  ): string {
+    return `Repository investigation is complete.
+
+${investigation.getContext()}
+
+The user's request is:
+
+${prompt}
+
+You are now in the IMPLEMENTATION phase.
+
+Do not produce a plan instead of implementing.
+
+Actually modify the repository.
+
+Use the available write_file tool to create or replace the files required for the requested feature.
+
+Implementation rules:
+
+1. Follow the architecture and conventions discovered during investigation.
+2. Do not invent dependencies when existing dependencies are sufficient.
+3. Do not overwrite unrelated files.
+4. Create the smallest coherent implementation that satisfies the request.
+5. Use write_file for actual file creation or modification.
+6. After writing files, use read_file to inspect and verify the files you created or modified.
+7. Use search_files only when needed to verify integration points or references.
+8. If tests already exist for the relevant behavior, follow their conventions.
+9. Do not stop after describing what you would do.
+10. Continue using tools until the requested implementation is actually present.
+11. Only provide the final response after the implementation has been completed and verified.
+
+Begin implementation now.`;
+  }
+
   /*
-   * Enforce the investigation strategy for implementation-plan tasks.
+   * Restrict the tools available during the implementation phase.
    *
-   * The investigation is evidence-driven rather than strictly ordered:
-   *
-   * feature search
-   *      ↓
-   * repository structure
-   *      ↓
-   * configuration
-   *      ↓
-   * implementation
-   *      ↓
-   * tests
-   *
-   * The model may choose the exact navigation path, but the application
-   * prevents obviously premature or irrelevant actions.
+   * Investigation-specific tools such as list_directory should not be used
+   * once implementation has started.
+   */
+  private validateImplementationToolCall(toolName: string): {
+    allowed: boolean;
+    reason?: string;
+  } {
+    if (
+      toolName === "write_file" ||
+      toolName === "read_file" ||
+      toolName === "search_files"
+    ) {
+      return {
+        allowed: true,
+      };
+    }
+
+    return {
+      allowed: false,
+      reason:
+        "Implementation phase is active. Do not perform broad repository exploration. Use write_file, read_file, or search_files for implementation and verification.",
+    };
+  }
+
+  /*
+   * Enforce the investigation strategy for implementation-plan and
+   * implementation tasks.
    */
   private validateInvestigationToolCall(
     investigation: InvestigationState,
@@ -468,28 +686,33 @@ Do not investigate further.`,
     allowed: boolean;
     reason?: string;
   } {
-    if (investigation.getTaskType() !== "implementation-plan") {
+    /*
+     * Factual questions are always allowed to perform the minimal tool
+     * investigation required to answer them.
+     */
+    if (investigation.getTaskType() === "factual") {
       return {
         allowed: true,
       };
     }
 
+    /*
+     * Implementation-plan and implementation tasks use the evidence-driven
+     * investigation flow.
+     */
     if (investigation.isComplete()) {
       return {
         allowed: false,
         reason:
-          "Investigation is complete. Do not call another tool. Produce the final implementation plan using the evidence already collected.",
+          "Investigation is complete. Stop investigating and transition to the next phase.",
       };
     }
 
-    /*
-     * Prevent the model from repeating an already executed investigation action.
-     *
-     * The model can still choose a different action, but it cannot waste an
-     * iteration repeating the same tool + arguments.
-     */
     const argumentsKey = this.createToolCallArgumentsKey(argumentsValue);
 
+    /*
+     * Prevent the model from repeating exactly the same investigation action.
+     */
     if (investigation.hasExecutedToolCall(toolName, argumentsKey)) {
       return {
         allowed: false,
@@ -501,8 +724,7 @@ Do not investigate further.`,
     const evidence = investigation.getEvidence();
 
     /*
-     * STEP 1:
-     * Feature existence must always be established first.
+     * Feature existence.
      */
     if (!evidence.featureSearchCompleted) {
       if (toolName === "search_files") {
@@ -514,13 +736,12 @@ Do not investigate further.`,
       return {
         allowed: false,
         reason:
-          "Feature existence has not been investigated yet. Use search_files first with one distinctive feature or concept term.",
+          "Feature existence has not been investigated yet. Use search_files first.",
       };
     }
 
     /*
-     * STEP 2:
-     * Once feature existence has been checked, inspect repository structure.
+     * Repository structure.
      */
     if (!evidence.repositoryStructureInspected) {
       if (toolName === "list_directory") {
@@ -537,8 +758,7 @@ Do not investigate further.`,
     }
 
     /*
-     * STEP 3:
-     * Inspect project configuration.
+     * Configuration.
      */
     if (!evidence.configurationInspected) {
       if (
@@ -558,8 +778,7 @@ Do not investigate further.`,
     }
 
     /*
-     * STEP 4:
-     * Inspect representative implementation.
+     * Implementation.
      */
     if (!evidence.implementationInspected) {
       if (
@@ -567,6 +786,12 @@ Do not investigate further.`,
         typeof argumentsValue.path === "string" &&
         this.isImplementationPath(argumentsValue.path)
       ) {
+        return {
+          allowed: true,
+        };
+      }
+
+      if (toolName === "search_files" || toolName === "list_directory") {
         return {
           allowed: true,
         };
@@ -580,8 +805,7 @@ Do not investigate further.`,
     }
 
     /*
-     * STEP 5:
-     * Inspect tests.
+     * Tests.
      */
     if (!evidence.testsInspected) {
       if (
@@ -589,6 +813,18 @@ Do not investigate further.`,
         typeof argumentsValue.path === "string" &&
         this.isTestPath(argumentsValue.path)
       ) {
+        return {
+          allowed: true,
+        };
+      }
+
+      if (toolName === "list_directory") {
+        return {
+          allowed: true,
+        };
+      }
+
+      if (toolName === "search_files") {
         return {
           allowed: true,
         };
@@ -604,7 +840,7 @@ Do not investigate further.`,
     return {
       allowed: false,
       reason:
-        "All required investigation evidence has been collected. Produce the final implementation plan.",
+        "All required investigation evidence has been collected. Stop investigating.",
     };
   }
 
@@ -644,10 +880,6 @@ Do not investigate further.`,
   private isImplementationPath(path: string): boolean {
     const normalized = path.toLowerCase().replace(/^.\//, "");
 
-    /*
-     * These files are evidence of implementation/configuration rather than
-     * tests or documentation.
-     */
     if (
       normalized.length === 0 ||
       normalized.startsWith("tests/") ||
@@ -668,16 +900,10 @@ Do not investigate further.`,
       return false;
     }
 
-    /*
-     * Configuration files are handled separately.
-     */
     if (this.isConfigurationPath(normalized)) {
       return false;
     }
 
-    /*
-     * Only treat source/code-like files as implementation evidence.
-     */
     return (
       normalized.endsWith(".ts") ||
       normalized.endsWith(".tsx") ||
@@ -689,29 +915,7 @@ Do not investigate further.`,
   }
 
   private isSearchResult(result: unknown): result is SearchFilesResult {
-    if (result === null || typeof result !== "object") {
-      return false;
-    }
-
-    const value = result as Record<string, unknown>;
-
-    if (!Array.isArray(value.matches)) {
-      return false;
-    }
-
-    return value.matches.every((match) => {
-      if (match === null || typeof match !== "object") {
-        return false;
-      }
-
-      const item = match as Record<string, unknown>;
-
-      return (
-        typeof item.path === "string" &&
-        typeof item.line === "number" &&
-        typeof item.text === "string"
-      );
-    });
+    return this.isSearchFilesResult(result);
   }
 
   private updateInvestigationEvidence(
@@ -721,18 +925,7 @@ Do not investigate further.`,
     result: unknown,
   ): void {
     if (toolName === "search_files") {
-      /*
-       * A successful search establishes only that the requested
-       * feature/concept was investigated.
-       *
-       * IMPORTANT:
-       *
-       * Finding a source/test/configuration file in search results does
-       * NOT mean that file has been inspected. Inspection requires an
-       * explicit read_file or list_directory action.
-       */
       investigation.markFeatureSearchCompleted();
-
       return;
     }
 
@@ -740,10 +933,6 @@ Do not investigate further.`,
       const path =
         typeof argumentsValue.path === "string" ? argumentsValue.path : ".";
 
-      /*
-       * Any successful directory listing gives us some structural evidence.
-       * This is intentionally limited to actual directory inspection.
-       */
       investigation.markRepositoryStructureInspected();
       investigation.recordPath(path);
 
@@ -762,36 +951,16 @@ Do not investigate further.`,
 
       const normalizedPath = path.toLowerCase();
 
-      /*
-       * Configuration evidence.
-       */
-      if (
-        normalizedPath === "package.json" ||
-        normalizedPath === "tsconfig.json" ||
-        normalizedPath.endsWith("/package.json") ||
-        normalizedPath.endsWith("/tsconfig.json") ||
-        normalizedPath.includes("/config/")
-      ) {
+      if (this.isConfigurationPath(path)) {
         investigation.markConfigurationInspected();
-
-        /*
-         * package.json and tsconfig.json are configuration evidence,
-         * not representative implementation evidence.
-         */
         return;
       }
 
-      /*
-       * Test evidence.
-       */
       if (this.isTestPath(normalizedPath)) {
         investigation.markTestsInspected();
         return;
       }
 
-      /*
-       * Documentation should not count as implementation evidence.
-       */
       if (
         normalizedPath === "readme.md" ||
         normalizedPath.endsWith("/readme.md") ||
@@ -800,9 +969,6 @@ Do not investigate further.`,
         return;
       }
 
-      /*
-       * Only source/code files count as implementation evidence.
-       */
       if (this.isImplementationPath(normalizedPath)) {
         investigation.markImplementationInspected();
       }
@@ -842,24 +1008,62 @@ Do not investigate further.`,
     }
   }
 
+  private normalizeWorkspacePath(path: string): string {
+    return path.replace(/^.\//, "");
+  }
+
+  private createToolCallArgumentsKey(
+    argumentsValue: Record<string, unknown>,
+  ): string {
+    const sortedArguments = Object.keys(argumentsValue)
+      .sort()
+      .reduce<Record<string, unknown>>((result, key) => {
+        result[key] = argumentsValue[key];
+        return result;
+      }, {});
+
+    return JSON.stringify(sortedArguments);
+  }
+
   private detectTaskType(prompt: string): InvestigationTaskType {
     const normalized = prompt.toLowerCase();
 
+    /*
+     * Explicit planning language wins over implementation language.
+     */
     const planningTerms = [
       "implementation plan",
-      "implementation",
       "propose",
       "plan",
       "how would you build",
       "how should we build",
       "what files",
       "which files",
-      "new feature",
       "do not modify any files",
+      "without modifying",
     ];
 
     if (planningTerms.some((term) => normalized.includes(term))) {
       return "implementation-plan";
+    }
+
+    /*
+     * Actual implementation requests.
+     */
+    const implementationTerms = [
+      "implement",
+      "build",
+      "create",
+      "develop",
+      "add",
+      "write",
+      "modify",
+      "change",
+      "make",
+    ];
+
+    if (implementationTerms.some((term) => normalized.includes(term))) {
+      return "implementation";
     }
 
     const existingFeatureTerms = [
@@ -909,160 +1113,96 @@ Do not investigate further.`,
     return value;
   }
 
-  private createToolCallArgumentsKey(
-    argumentsValue: Record<string, unknown>,
-  ): string {
-    return JSON.stringify(
-      Object.keys(argumentsValue)
-        .sort()
-        .reduce<Record<string, unknown>>((result, key) => {
-          result[key] = argumentsValue[key];
-          return result;
-        }, {}),
-    );
-  }
-
   private buildSystemPrompt(
     memoryContext: string,
     investigation: InvestigationState,
   ): string {
-    return `You are a local project investigation agent.
+    const taskType = investigation.getTaskType();
 
-      Answer questions about this repository using project memory and repository tools.
+    return `You are a local project coding agent.
 
-      Core rules:
+You work inside the current repository.
 
-      1. Never invent project-specific facts.
-      2. Use project memory when it directly answers the question.
-      3. Otherwise investigate the repository using the available tools.
-      4. Treat every tool result as evidence.
-      5. Never assume that a requested feature already exists.
-      6. Distinguish factual questions, existing-feature investigations, and implementation-planning requests.
+Your job is to investigate, plan, implement, and verify changes using the available repository tools.
 
-      Targeted factual questions:
+Core rules:
 
-      7. Start with one distinctive search term.
-      8. If search_files directly provides sufficient evidence, answer immediately.
-      9. Do not call read_file when search_files already provides sufficient evidence.
-      10. Keep simple factual answers concise.
+1. Never invent project-specific facts.
+2. Use project memory when it directly answers the question.
+3. Otherwise investigate the repository using the available tools.
+4. Treat every tool result as evidence.
+5. Never assume that a requested feature already exists.
+6. Choose actions based on the current investigation state.
+7. Do not modify files during investigation unless the user explicitly requested implementation.
 
-      Existing-feature investigations:
+Task type:
 
-      11. Search for the requested concept or identifier.
-      12. Inspect only files necessary to answer the question.
-      13. Prefer implementation and configuration over tests and documentation.
-      14. Use read_file when search results are ambiguous or insufficient.
+${taskType}
 
-      New-feature / implementation-planning requests:
+For factual questions:
 
-      15. First determine whether the requested feature already exists.
-      16. If a feature search returns zero matches, do not repeat the same search.
-      17. Treat zero matches as evidence that the feature may not exist.
-      18. Discover the repository architecture before proposing implementation changes.
-      19. Use list_directory when repository structure is not known.
-      20. Inspect package/configuration files for runtime, dependencies, and conventions.
-      21. Inspect representative implementation files.
-      22. Inspect relevant tests.
-      23. Identify existing extension points.
-      24. Do not claim a file needs to change without repository evidence.
-      25. Clearly distinguish:
-        - existing files to change,
-        - new files to create,
-        - files inspected only for evidence.
+- Use the minimum investigation necessary.
+- Start with a distinctive search term.
+- If search_files directly provides sufficient evidence, answer immediately.
 
-      Investigation progress:
+For existing-feature questions:
 
-      26. Every tool call must discover new information, inspect relevant information, or resolve an ambiguity.
-      27. Do not repeat identical successful investigation.
-      28. After a zero-match search, change strategy.
-      29. Do not repeatedly inspect the same paths without reason.
-      30. Stop when evidence is sufficient.
-      31. Never modify files unless explicitly asked.
+- Search for the requested concept.
+- Inspect only the relevant implementation.
+- Use tests when they clarify behavior.
 
-      Important investigation behavior:
+For implementation-plan requests:
 
-      32. Always inspect missing evidence categories before producing an implementation plan.
-      33. If configuration is missing, inspect package.json or tsconfig.json.
-      34. If implementation evidence is missing, inspect representative source files.
-      35. If test evidence is missing, inspect the tests directory and relevant test files.
-      36. If repository structure is already known, do not repeatedly list the same directory.
-      37. When a tool call is rejected as a duplicate, immediately choose a different investigation action.
-      38. Use the current investigation state to decide what evidence is still missing.
-      39. Do not stop merely because you have discovered that the requested feature does not exist.
-      40. For implementation plans, continue until all required evidence categories are complete.
-      41. Once all required evidence categories are complete, stop investigating and produce the final answer.
-      42. Do not call additional tools after the investigation is complete.
-      43. Base the final implementation plan only on evidence already gathered.
-      44. If the investigation is complete, do not attempt another repository inspection even if additional information could be interesting.
-      45. Prefer producing the answer over gathering optional additional evidence.
+- First establish whether the feature already exists.
+- Inspect repository structure.
+- Inspect configuration.
+- Inspect representative implementation.
+- Inspect relevant tests.
+- Do not modify files.
+- Once evidence is complete, produce an evidence-backed implementation plan.
 
-      Current investigation state:
+For implementation requests:
 
-      ${investigation.getContext()}
+PHASE 1 — INVESTIGATION
 
-      Project memory:
+- First determine whether the requested feature already exists.
+- Inspect repository structure.
+- Inspect configuration and dependencies.
+- Inspect representative implementation.
+- Inspect relevant tests.
+- Do not write files during this phase.
+- Do not invent architecture when the repository already provides extension points.
 
-      ${memoryContext}`;
-  }
+PHASE 2 — IMPLEMENTATION
 
-  private getRequiredInvestigationTool(investigation: InvestigationState):
-    | {
-        name: string;
-        arguments: Record<string, unknown>;
-      }
-    | undefined {
-    if (investigation.getTaskType() !== "implementation-plan") {
-      return undefined;
-    }
+Once investigation evidence is complete:
 
-    const evidence = investigation.getEvidence();
+- Stop broad investigation.
+- Actually implement the requested feature.
+- Use write_file to create or replace files.
+- Follow the repository's existing architecture and conventions.
+- Do not merely provide a plan.
+- Do not modify unrelated files.
+- Continue until the requested implementation actually exists.
 
-    if (!evidence.featureSearchCompleted) {
-      return {
-        name: "search_files",
-        arguments: {
-          query: "Todo",
-        },
-      };
-    }
+PHASE 3 — VERIFICATION
 
-    if (!evidence.repositoryStructureInspected) {
-      return {
-        name: "list_directory",
-        arguments: {
-          path: ".",
-        },
-      };
-    }
+After writing:
 
-    if (!evidence.configurationInspected) {
-      return {
-        name: "read_file",
-        arguments: {
-          path: "package.json",
-        },
-      };
-    }
+- Inspect the files you created or changed.
+- Use read_file to verify the files you created or modified.
+- Use search_files only when needed to verify integration points or references.
+- Check that imports, paths, and integration points are consistent.
+- If appropriate tests are available, follow their conventions.
+- Do not claim success merely because write_file succeeded.
 
-    if (!evidence.implementationInspected) {
-      return {
-        name: "read_file",
-        arguments: {
-          path: "src/index.ts",
-        },
-      };
-    }
+Investigation progress:
 
-    if (!evidence.testsInspected) {
-      return {
-        name: "read_file",
-        arguments: {
-          path: "src/tests/test-agent-investigation.ts",
-        },
-      };
-    }
+${investigation.getContext()}
 
-    return undefined;
+Project memory:
+
+${memoryContext}`;
   }
 
   private isConcreteValueQuestion(prompt: string): boolean {
@@ -1140,12 +1280,12 @@ Do not investigate further.`,
         return false;
       }
 
-      const value = match as Record<string, unknown>;
+      const item = match as Record<string, unknown>;
 
       return (
-        typeof value.path === "string" &&
-        typeof value.line === "number" &&
-        typeof value.text === "string"
+        typeof item.path === "string" &&
+        typeof item.line === "number" &&
+        typeof item.text === "string"
       );
     });
   }
