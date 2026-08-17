@@ -57,7 +57,8 @@ export class OllamaProvider implements ModelProvider {
         think: false,
         keep_alive: "10m",
         options: {
-          num_predict: 128,
+          num_predict: 2048,
+          num_ctx: 8192,
         },
       }),
     });
