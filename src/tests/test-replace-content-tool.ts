@@ -84,7 +84,7 @@ export class TodoService {
 `,
   );
 
-  // 3. Target not found (0 matches) => rejected with descriptive error
+  // 3. Target not found (0 matches) => rejected with descriptive error containing target path & bounded excerpt
   await assert.rejects(
     async () => {
       await tool.execute({
@@ -95,12 +95,57 @@ export class TodoService {
     },
     (err: Error) => {
       assert.match(err.message, /Target content not found in file: 'src\/todos.ts'/);
+      assert.match(err.message, /Current file content excerpt \(src\/todos.ts\):/);
+      assert.match(err.message, /TodoService/);
+      assert.match(err.message, /read_file/);
       return true;
     },
   );
 
-  // 4. Multiple matches (>1 matches) => rejected with descriptive error
-  // Setup file with duplicates
+  // 4. Large file 0-match error produces bounded excerpt
+  const largeFilePath = join(root, "src", "large.ts");
+  const largeLines: string[] = [];
+  for (let i = 1; i <= 100; i++) {
+    largeLines.push(`export const line${i} = "This is line number ${i} in a very large file with lots of content";`);
+  }
+  await writeFile(largeFilePath, largeLines.join("\n"), "utf8");
+
+  await assert.rejects(
+    async () => {
+      await tool.execute({
+        path: "src/large.ts",
+        target: "missingTargetString",
+        replacement: "rep",
+      });
+    },
+    (err: Error) => {
+      assert.match(err.message, /Target content not found in file: 'src\/large.ts'/);
+      assert.match(err.message, /more lines omitted/);
+      assert.strictEqual(err.message.length < 3000, true, "Excerpt must be bounded in length");
+      return true;
+    },
+  );
+
+  // 5. Excerpt strictly contains content only from requested workspace file
+  const privateFilePath = join(root, "src", "secret.ts");
+  await writeFile(privateFilePath, `const SECRET_TOKEN = "xyz-123-private";\n`, "utf8");
+
+  await assert.rejects(
+    async () => {
+      await tool.execute({
+        path: "src/todos.ts",
+        target: "SECRET_TOKEN",
+        replacement: "TOKEN",
+      });
+    },
+    (err: Error) => {
+      assert.strictEqual(err.message.includes("xyz-123-private"), false, "Must not leak content from other files");
+      assert.match(err.message, /TodoService/);
+      return true;
+    },
+  );
+
+  // 6. Multiple matches (>1 matches) => rejected with descriptive error
   await writeFile(
     join(root, "src", "dup.ts"),
     `const a = 1;\nconst b = 1;\nconst c = 1;\n`,
@@ -120,7 +165,7 @@ export class TodoService {
     },
   );
 
-  // 5. Empty target => rejected
+  // 7. Empty target => rejected
   await assert.rejects(
     async () => {
       await tool.execute({
@@ -135,7 +180,7 @@ export class TodoService {
     },
   );
 
-  // 6. Empty replacement => valid deletion
+  // 8. Empty replacement => valid deletion
   await tool.execute({
     path: "src/dup.ts",
     target: "const c = 1;\n",
@@ -144,7 +189,7 @@ export class TodoService {
   const dupContentAfterDeletion = await readFile(join(root, "src", "dup.ts"), "utf8");
   assert.strictEqual(dupContentAfterDeletion, `const a = 1;\nconst b = 1;\n`);
 
-  // 7. Special characters in target
+  // 9. Special characters in target
   await writeFile(
     join(root, "src", "special.ts"),
     `const regex = /^[a-z]+$/;\nconst arr = [1, 2, (3 + 4)];\n`,
@@ -161,7 +206,7 @@ export class TodoService {
     `const regex = /^[A-Z]+$/;\nconst arr = [1, 2, (3 + 4)];\n`,
   );
 
-  // 8. Path traversal rejection
+  // 10. Path traversal rejection
   await assert.rejects(
     async () => {
       await tool.execute({
@@ -176,7 +221,7 @@ export class TodoService {
     },
   );
 
-  // 9. Absolute path rejection
+  // 11. Absolute path rejection
   await assert.rejects(
     async () => {
       await tool.execute({
@@ -191,7 +236,7 @@ export class TodoService {
     },
   );
 
-  // 10. Non-existent file rejection
+  // 12. Non-existent file rejection
   await assert.rejects(
     async () => {
       await tool.execute({
@@ -206,7 +251,7 @@ export class TodoService {
     },
   );
 
-  // 11. Directory path target rejection
+  // 13. Directory path target rejection
   await assert.rejects(
     async () => {
       await tool.execute({
