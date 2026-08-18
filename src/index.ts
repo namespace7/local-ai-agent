@@ -14,6 +14,7 @@ import { ProjectMemory } from "./memory/ProjectMemory.js";
 import { RememberTool } from "./memory/RememberTool.js";
 import { SearchFilesTool } from "./tools/SearchFilesTool.js";
 import { WriteFileTool } from "./tools/WriteFileTool.js";
+import { ReplaceContentTool } from "./tools/ReplaceContentTool.js";
 import { RunCommandTool } from "./tools/RunCommandTool.js";
 
 async function main(): Promise<void> {
@@ -36,6 +37,7 @@ async function main(): Promise<void> {
   tools.register(new ReadFileTool(workspace));
   tools.register(new SearchFilesTool(workspace));
   tools.register(new WriteFileTool(workspace));
+  tools.register(new ReplaceContentTool(workspace));
   tools.register(new RunCommandTool(workspace));
   tools.register(new BrowserNavigateTool(browser));
   tools.register(new BrowserSnapshotTool(browser));

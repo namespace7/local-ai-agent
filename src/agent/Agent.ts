@@ -215,7 +215,7 @@ ${investigation.getContext()}
 
 You must continue implementing the requested feature.
 
-Use write_file to create or modify the required files.
+Use write_file to create or modify required files, or replace_content to make targeted edits.
 
 After writing files, inspect the created or modified files to verify the result.
 
@@ -304,7 +304,7 @@ Continue investigating the repository using the available tools. Choose a tool c
 
 ${investigation.getContext()}
 
-Use write_file to implement the requested change.
+Use write_file to create or rewrite files, or replace_content to make targeted edits to existing files.
 
 Use read_file to inspect files you created or modified.
 
@@ -322,16 +322,20 @@ Continue implementing the requested feature.`,
            * REPAIR EVIDENCE GATE
            *
            * After a verification failure, the controller records which
-           * workspace files were named in the error output.  write_file is
-           * blocked until every such file has been read at least once since
-           * the failure.  This prevents the model from rewriting the wrong
-           * file (as in Run 12) without first inspecting the one that is
-           * actually broken.
+           * workspace files were named in the error output.  write_file and
+           * replace_content are blocked until every such file has been read at
+           * least once since the failure.  This prevents the model from
+           * rewriting or modifying the wrong file (as in Run 12) without first
+           * inspecting the one that is actually broken.
            *
            * read_file, run_command, and search_files are always allowed.
            */
+          const isMutationTool =
+            toolCall.name === "write_file" ||
+            toolCall.name === "replace_content";
+
           if (
-            toolCall.name === "write_file" &&
+            isMutationTool &&
             investigation.hasUnreadRepairEvidence()
           ) {
             const unreadPaths = investigation.getUnreadRepairPaths();
@@ -345,13 +349,29 @@ Continue implementing the requested feature.`,
 
             const pathList = unreadPaths.map((p) => `  - ${p}`).join("\n");
 
+            /*
+             * Repair echo (Approach D):
+             * Extract a bounded, useful description of the rejected mutation
+             * so the model can re-issue it after satisfying the read requirement.
+             * Only the file path and tool name are echoed — not arbitrary content
+             * blobs — to keep the echo safe and prompt-efficient.
+             */
+            const attemptedPath =
+              typeof toolCall.arguments?.path === "string"
+                ? toolCall.arguments.path
+                : undefined;
+
+            const repairEcho = attemptedPath
+              ? `\nYour attempted ${toolCall.name} on "${attemptedPath}" was NOT executed.\n\nAfter you have read the required file(s) above, you MUST re-issue your ${toolCall.name} on "${attemptedPath}" before running any verification command.\nDo NOT run verification until after the repair has been applied.\n`
+              : `\nYour attempted ${toolCall.name} was NOT executed.\n\nAfter you have read the required file(s) above, re-issue your ${toolCall.name} repair before running any verification command.\nDo NOT run verification until after the repair has been applied.\n`;
+
             messages.push({
               role: "tool",
               toolCallId: toolCall.id,
               content: JSON.stringify({
                 success: false,
                 error:
-                  "write_file rejected: verification failed and implicated files have not been inspected.",
+                  `${toolCall.name} rejected: verification failed and implicated files have not been inspected.`,
               }),
             });
 
@@ -364,9 +384,7 @@ Verification failed and the following file(s) have not been inspected since the 
 ${pathList}
 
 You must call read_file on each of these file(s) before making any repair write.
-
-Do not attempt write_file again until all listed files have been read.
-
+${repairEcho}
 ${investigation.getContext()}`,
             });
 
@@ -503,10 +521,11 @@ Choose the next implementation or verification action.`,
         }
 
         /*
-         * Track files created or modified by write_file.
+         * Track files created or modified by write_file or replace_content.
          */
         if (
-          toolCall.name === "write_file" &&
+          (toolCall.name === "write_file" ||
+            toolCall.name === "replace_content") &&
           execution.result !== undefined
         ) {
           const result = execution.result as {
@@ -571,7 +590,7 @@ Stderr:
 ${commandResult?.stderr || "(none)"}
 
 Repair instructions:
-1. Repair the specific reported errors above using write_file. Make the smallest targeted repair possible rather than redesigning the project.
+1. Repair the specific reported errors above. Use replace_content for targeted edits to existing files, or write_file if creating/rewriting files. Make the smallest targeted repair possible rather than redesigning the project.
 2. Preserve existing project configuration discovered during investigation (package.json scripts, test framework, dependencies, TypeScript/module settings).
 3. Do NOT switch test frameworks during repair (e.g. if the project uses node:test, continue using node:test).
 4. Do NOT create duplicate source files with a different extension to work around an error.
@@ -782,7 +801,7 @@ Do not produce a plan instead of implementing.
 
 Actually modify the repository.
 
-Use the available write_file tool to create or replace the files required for the requested feature.
+Use write_file to create new files or replace_content to make targeted edits to existing files required for the requested feature.
 
 Implementation rules:
 
@@ -790,11 +809,11 @@ Implementation rules:
 2. Do not invent dependencies when existing dependencies are sufficient.
 3. Do not overwrite unrelated files.
 4. Create the smallest coherent implementation that satisfies the request.
-5. Use write_file for actual file creation or modification.
+5. Use write_file for file creation/rewrite, or replace_content for targeted edits.
 6. Use read_file only for file inspection. Reading files does NOT verify implementation.
 7. Execute actual project verification using run_command (e.g. 'npx tsc --noEmit', 'npm run typecheck', or 'npm test').
 8. Writing or modifying files invalidates any previous verification result.
-9. If verification fails, inspect the stdout/stderr output and use write_file to repair the implementation.
+9. If verification fails, inspect the stdout/stderr output and repair the implementation using replace_content or write_file.
 10. Do not stop after describing what you would do.
 11. Continue using tools until a verification command succeeds after the latest write.
 12. Only provide the final response after verification has succeeded on the latest code.
@@ -814,6 +833,7 @@ Begin implementation now.`;
   } {
     if (
       toolName === "write_file" ||
+      toolName === "replace_content" ||
       toolName === "read_file" ||
       toolName === "search_files" ||
       toolName === "run_command"
@@ -826,7 +846,7 @@ Begin implementation now.`;
     return {
       allowed: false,
       reason:
-        "Implementation phase is active. Do not perform broad repository exploration. Use write_file, read_file, search_files, or run_command for implementation and verification.",
+        "Implementation phase is active. Do not perform broad repository exploration. Use write_file, replace_content, read_file, search_files, or run_command for implementation and verification.",
     };
   }
 
@@ -1461,7 +1481,7 @@ Once investigation evidence is complete:
 
 - Stop broad investigation.
 - Actually implement the requested feature.
-- Use write_file to create or replace files.
+- Use write_file to create or replace files, or replace_content for targeted edits.
 - Follow the repository's existing architecture and conventions.
 - Do not merely provide a plan.
 - Do not modify unrelated files.
@@ -1473,8 +1493,8 @@ After writing:
 
 - Use read_file to inspect created or modified files. Read_file does NOT mark verification complete.
 - Use run_command to execute project verification (e.g., 'npx tsc --noEmit', 'npm run typecheck', or 'npm test').
-- Any write_file operation invalidates previous verification results.
-- If run_command fails, review the stdout/stderr error details and use write_file to repair the code.
+- Any write_file or replace_content operation invalidates previous verification results.
+- If run_command fails, review the stdout/stderr error details and use replace_content or write_file to repair the code.
 - Do not claim implementation success until a verification command succeeds after the latest write.
 
 Investigation progress:
