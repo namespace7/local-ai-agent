@@ -1,5 +1,4 @@
 import { readFile, writeFile, rename, unlink, stat } from "node:fs/promises";
-import { dirname } from "node:path";
 import type { Tool } from "./Tool.js";
 import type { Workspace } from "../workspace/Workspace.js";
 
@@ -64,8 +63,12 @@ export class ReplaceContentTool implements Tool {
 
     const firstIndex = originalContent.indexOf(parsed.target);
     if (firstIndex === -1) {
+      const excerpt = this.generateBoundedExcerpt(originalContent);
       throw new Error(
-        `Target content not found in file: '${parsed.path}'. Verify exact whitespace, casing, and line breaks.`,
+        `Target content not found in file: '${parsed.path}'.\n\n` +
+          `Current file content excerpt (${parsed.path}):\n` +
+          `\`\`\`\n${excerpt}\n\`\`\`\n\n` +
+          `Inspect the excerpt above or use read_file to check exact whitespace, casing, and line breaks before attempting replacement.`,
       );
     }
 
@@ -112,6 +115,31 @@ export class ReplaceContentTool implements Tool {
       bytesWritten: Buffer.byteLength(newContent, "utf8"),
       occurrences: 1,
     } satisfies ReplaceContentResult;
+  }
+
+  private generateBoundedExcerpt(content: string, maxLines = 40, maxChars = 2000): string {
+    const lines = content.split("\n");
+    if (lines.length <= maxLines && content.length <= maxChars) {
+      return content;
+    }
+
+    let boundedLines = lines.slice(0, maxLines);
+    let excerpt = boundedLines.join("\n");
+
+    if (excerpt.length > maxChars) {
+      excerpt = excerpt.slice(0, maxChars);
+      const lastNewline = excerpt.lastIndexOf("\n");
+      if (lastNewline > 0) {
+        excerpt = excerpt.slice(0, lastNewline);
+      }
+    }
+
+    const remainingLines = lines.length - excerpt.split("\n").length;
+    if (remainingLines > 0) {
+      excerpt += `\n... (${remainingLines} more lines omitted)`;
+    }
+
+    return excerpt;
   }
 
   private parseInput(input: unknown): ReplaceContentInput {
