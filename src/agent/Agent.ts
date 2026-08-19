@@ -480,6 +480,18 @@ Produce the final answer using the evidence already collected.`,
          * Do not treat duplicate calls as new implementation work.
          */
         if (execution.duplicate) {
+          /*
+           * Satisfy repair evidence when the model reads a path that was
+           * implicated in the last verification failure, even if the read_file
+           * call was classified as a duplicate.
+           */
+          if (
+            toolCall.name === "read_file" &&
+            typeof toolCall.arguments?.path === "string"
+          ) {
+            investigation.satisfyRepairPath(toolCall.arguments.path as string);
+          }
+
           messages.push({
             role: "user",
             content: `This exact tool call was already executed.
@@ -533,10 +545,20 @@ Choose the next implementation or verification action.`,
           };
 
           if (typeof result.path === "string") {
-            const content =
+            let content =
               typeof toolCall.arguments?.content === "string"
                 ? toolCall.arguments.content
                 : undefined;
+
+            if (content === undefined && toolCall.name === "replace_content") {
+              try {
+                const absPath = path.resolve(this.getWorkspaceRoot(), result.path);
+                if (fs.existsSync(absPath)) {
+                  content = fs.readFileSync(absPath, "utf8");
+                }
+              } catch {}
+            }
+
             investigation.recordWrittenFile(result.path, content);
 
             console.log("[implementation-write]", result.path);
