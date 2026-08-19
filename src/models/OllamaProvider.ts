@@ -130,49 +130,158 @@ export class OllamaProvider implements ModelProvider {
     content: string,
     tools: ToolDefinition[],
   ): ToolCall[] {
-    let jsonString: string | undefined;
+    let unFenced = content.trim();
 
     // 1. Check if the entire trimmed content is a fenced code block: ```json ... ``` or ``` ... ```
-    const fenceMatch = content.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
-    if (fenceMatch) {
-      jsonString = fenceMatch[1]?.trim();
-    } else if (content.startsWith("{") && content.endsWith("}")) {
-      // 2. Entire trimmed content is plain JSON
-      jsonString = content;
+    const fenceMatch = unFenced.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
+    if (fenceMatch && fenceMatch[1] !== undefined) {
+      unFenced = fenceMatch[1].trim();
     }
 
-    if (!jsonString) {
+    if (!unFenced) {
       return [];
     }
 
-    try {
-      const parsed: unknown = JSON.parse(jsonString);
-      return this.validateAndConvertParsedToolCall(parsed, tools);
-    } catch {
+    // 2. Check if content is a JSON Array: [...]
+    if (unFenced.startsWith("[") && unFenced.endsWith("]")) {
+      try {
+        const parsedArray: unknown = JSON.parse(unFenced);
+        if (Array.isArray(parsedArray)) {
+          const toolCalls: ToolCall[] = [];
+          for (const item of parsedArray) {
+            const converted = this.validateAndConvertParsedToolCall(
+              item,
+              tools,
+              toolCalls.length,
+            );
+            if (converted) {
+              toolCalls.push(converted);
+            }
+          }
+          return toolCalls;
+        }
+      } catch {
+        // Fall through to object extraction
+      }
+    }
+
+    // 3. Extract one or more JSON objects (JSONL or single JSON)
+    const jsonObjects = this.extractJsonObjects(unFenced);
+    if (!jsonObjects || jsonObjects.length === 0) {
       return [];
     }
+
+    const toolCalls: ToolCall[] = [];
+    for (const jsonStr of jsonObjects) {
+      try {
+        const parsed: unknown = JSON.parse(jsonStr);
+        const converted = this.validateAndConvertParsedToolCall(
+          parsed,
+          tools,
+          toolCalls.length,
+        );
+        if (converted) {
+          toolCalls.push(converted);
+        }
+      } catch {
+        // Skip malformed individual object
+      }
+    }
+
+    return toolCalls;
+  }
+
+  /**
+   * Extracts top-level JSON objects from text when formatted as single JSON or JSONL.
+   * If any non-whitespace characters exist outside JSON object boundaries, returns null
+   * to ensure ordinary conversational prose containing JSON is never parsed as tool calls.
+   */
+  private extractJsonObjects(text: string): string[] | null {
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const objects: string[] = [];
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let startIndex = -1;
+
+    for (let i = 0; i < trimmed.length; i++) {
+      const char = trimmed[i];
+
+      if (inString) {
+        if (escape) {
+          escape = false;
+        } else if (char === "\\") {
+          escape = true;
+        } else if (char === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      if (char === '"') {
+        inString = true;
+        continue;
+      }
+
+      if (char === "{") {
+        if (depth === 0) {
+          startIndex = i;
+        }
+        depth++;
+      } else if (char === "}") {
+        if (depth === 0) {
+          return null;
+        }
+        depth--;
+        if (depth === 0 && startIndex !== -1) {
+          objects.push(trimmed.substring(startIndex, i + 1));
+          startIndex = -1;
+        }
+      } else {
+        if (
+          depth === 0 &&
+          char !== " " &&
+          char !== "\t" &&
+          char !== "\n" &&
+          char !== "\r"
+        ) {
+          return null;
+        }
+      }
+    }
+
+    if (depth !== 0 || inString || objects.length === 0) {
+      return null;
+    }
+
+    return objects;
   }
 
   private validateAndConvertParsedToolCall(
     parsed: unknown,
     tools: ToolDefinition[],
-  ): ToolCall[] {
+    index: number,
+  ): ToolCall | null {
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return [];
+      return null;
     }
 
     const record = parsed as Record<string, unknown>;
 
     // Validate name
     if (typeof record.name !== "string" || record.name.trim().length === 0) {
-      return [];
+      return null;
     }
     const toolName = record.name.trim();
 
     // Validate that the requested tool name exists in the supplied tool definitions
     const toolExists = tools.some((t) => t.function.name === toolName);
     if (!toolExists) {
-      return [];
+      return null;
     }
 
     // Validate arguments: must be non-null, non-array object
@@ -181,15 +290,13 @@ export class OllamaProvider implements ModelProvider {
       record.arguments === null ||
       Array.isArray(record.arguments)
     ) {
-      return [];
+      return null;
     }
 
-    return [
-      {
-        id: `tool-call-fallback-0`,
-        name: toolName,
-        arguments: record.arguments as Record<string, unknown>,
-      },
-    ];
+    return {
+      id: `tool-call-fallback-${index}`,
+      name: toolName,
+      arguments: record.arguments as Record<string, unknown>,
+    };
   }
 }

@@ -275,4 +275,147 @@ console.log("Running OllamaProvider tool parsing unit tests...\n");
   console.log("PASS: 12. Fallback arguments preserve nested objects/arrays");
 }
 
-console.log("\nAll 12 OllamaProvider tool parsing tests PASSED.");
+// 13. Two JSONL tool calls normalized
+{
+  const msg = {
+    role: "assistant",
+    content: `{"name":"search_files","arguments":{"query":"foo"}}\n{"name":"list_directory","arguments":{"path":"src"}}`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].id, "tool-call-fallback-0");
+  assert.strictEqual(calls[0].name, "search_files");
+  assert.deepStrictEqual(calls[0].arguments, { query: "foo" });
+  assert.strictEqual(calls[1].id, "tool-call-fallback-1");
+  assert.strictEqual(calls[1].name, "list_directory");
+  assert.deepStrictEqual(calls[1].arguments, { path: "src" });
+  console.log("PASS: 13. Two JSONL tool calls normalized");
+}
+
+// 14. Three JSONL tool calls normalized
+{
+  const msg = {
+    role: "assistant",
+    content: `{"name":"search_files","arguments":{"query":"a"}}\n{"name":"list_directory","arguments":{"path":"."}}\n{"name":"search_files","arguments":{"query":"b"}}`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 3);
+  assert.strictEqual(calls[0].id, "tool-call-fallback-0");
+  assert.strictEqual(calls[0].name, "search_files");
+  assert.strictEqual(calls[1].id, "tool-call-fallback-1");
+  assert.strictEqual(calls[1].name, "list_directory");
+  assert.strictEqual(calls[2].id, "tool-call-fallback-2");
+  assert.strictEqual(calls[2].name, "search_files");
+  console.log("PASS: 14. Three JSONL tool calls normalized");
+}
+
+// 15. Whitespace and blank lines between JSONL objects
+{
+  const msg = {
+    role: "assistant",
+    content: `   {"name":"search_files","arguments":{"query":"a"}}   \n\n\n   \t  {"name":"list_directory","arguments":{"path":"b"}}   \n\n  `,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].name, "search_files");
+  assert.strictEqual(calls[1].name, "list_directory");
+  console.log("PASS: 15. Whitespace and blank lines between JSONL objects");
+}
+
+// 16. JSONL arguments preserve nested objects and arrays
+{
+  const msg = {
+    role: "assistant",
+    content: `{"name":"complex_tool","arguments":{"config":{"debug":true},"tags":["a","b"]}}\n{"name":"search_files","arguments":{"query":"test"}}`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].name, "complex_tool");
+  assert.deepStrictEqual(calls[0].arguments, { config: { debug: true }, tags: ["a", "b"] });
+  assert.strictEqual(calls[1].name, "search_files");
+  console.log("PASS: 16. JSONL arguments preserve nested objects and arrays");
+}
+
+// 17. Malformed individual JSONL object is skipped; valid object is preserved
+{
+  const msg = {
+    role: "assistant",
+    content: `{"name": "search_files", "arguments": {"query": "valid"}}\n{ invalid json here }\n{"name": "list_directory", "arguments": {"path": "src"}}`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].id, "tool-call-fallback-0");
+  assert.strictEqual(calls[0].name, "search_files");
+  assert.strictEqual(calls[1].id, "tool-call-fallback-1");
+  assert.strictEqual(calls[1].name, "list_directory");
+  console.log("PASS: 17. Malformed individual JSONL object is skipped; valid object is preserved");
+}
+
+// 18. Unknown tool name inside JSONL is skipped
+{
+  const msg = {
+    role: "assistant",
+    content: `{"name": "unknown_tool", "arguments": {}}\n{"name": "search_files", "arguments": {"query": "valid"}}`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].id, "tool-call-fallback-0");
+  assert.strictEqual(calls[0].name, "search_files");
+  console.log("PASS: 18. Unknown tool name inside JSONL is skipped");
+}
+
+// 19. Invalid arguments inside JSONL is skipped
+{
+  const msg = {
+    role: "assistant",
+    content: `{"name": "search_files", "arguments": "string_instead_of_object"}\n{"name": "search_files", "arguments": {"query": "valid"}}`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 1);
+  assert.strictEqual(calls[0].id, "tool-call-fallback-0");
+  assert.strictEqual(calls[0].name, "search_files");
+  console.log("PASS: 19. Invalid arguments inside JSONL is skipped");
+}
+
+// 20. Fenced JSONL multiple tool calls
+{
+  const msg = {
+    role: "assistant",
+    content: "```json\n{\"name\":\"search_files\",\"arguments\":{\"query\":\"a\"}}\n{\"name\":\"list_directory\",\"arguments\":{\"path\":\"b\"}}\n```",
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].name, "search_files");
+  assert.strictEqual(calls[1].name, "list_directory");
+  console.log("PASS: 20. Fenced JSONL multiple tool calls");
+}
+
+// 21. JSON Array tool calls [...]
+{
+  const msg = {
+    role: "assistant",
+    content: `[\n  {"name": "search_files", "arguments": {"query": "a"}},\n  {"name": "list_directory", "arguments": {"path": "b"}}\n]`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[0].id, "tool-call-fallback-0");
+  assert.strictEqual(calls[0].name, "search_files");
+  assert.strictEqual(calls[1].id, "tool-call-fallback-1");
+  assert.strictEqual(calls[1].name, "list_directory");
+  console.log("PASS: 21. JSON Array tool calls [...]");
+}
+
+// 22. Deterministic fallback IDs indexing
+{
+  const msg = {
+    role: "assistant",
+    content: `{"name":"search_files","arguments":{"query":"0"}}\n{"name":"search_files","arguments":{"query":"1"}}\n{"name":"search_files","arguments":{"query":"2"}}`,
+  };
+  const calls = provider.testNormalize(msg, dummyTools);
+  assert.strictEqual(calls[0].id, "tool-call-fallback-0");
+  assert.strictEqual(calls[1].id, "tool-call-fallback-1");
+  assert.strictEqual(calls[2].id, "tool-call-fallback-2");
+  console.log("PASS: 22. Deterministic fallback IDs indexing");
+}
+
+console.log("\nAll 22 OllamaProvider tool parsing tests PASSED.");
