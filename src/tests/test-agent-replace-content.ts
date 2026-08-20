@@ -104,7 +104,18 @@ try {
         },
       ],
     },
-    // Turn 1: Model reads package.json
+    // Turn 1: Model inspects repository structure
+    {
+      content: "",
+      toolCalls: [
+        {
+          id: "call_list",
+          name: "list_directory",
+          arguments: { path: "." },
+        },
+      ],
+    },
+    // Turn 2: Model reads package.json
     {
       content: "",
       toolCalls: [
@@ -115,7 +126,7 @@ try {
         },
       ],
     },
-    // Turn 2: Model reads src/todos.ts (investigation evidence)
+    // Turn 3: Model reads src/todos.ts (investigation evidence)
     {
       content: "",
       toolCalls: [
@@ -126,7 +137,18 @@ try {
         },
       ],
     },
-    // Turn 3: Model runs typecheck -> FAILS, implicating src/todos.ts
+    // Turn 4: Model reads src/tests/todos.test.ts (investigation evidence)
+    {
+      content: "",
+      toolCalls: [
+        {
+          id: "call_test_inspect",
+          name: "read_file",
+          arguments: { path: "src/tests/todos.test.ts" },
+        },
+      ],
+    },
+    // Turn 5: Model runs typecheck -> FAILS, implicating src/todos.ts
     {
       content: "",
       toolCalls: [
@@ -209,7 +231,7 @@ try {
   const memory = new ProjectMemory(path.join(tmpWorkspace, "project-memory.json"));
 
   const agent = new Agent(model, tools, trace, memory, {
-    maxIterations: 10,
+    maxIterations: 15,
     workspaceRoot: tmpWorkspace,
   });
 

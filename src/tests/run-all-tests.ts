@@ -15,6 +15,8 @@ const repoRoot = path.resolve(currentDir, "../..");
 const DETERMINISTIC_TEST_FILES = [
   "test-cli.ts",
   "test-agent-runner-api.ts",
+  "test-agent-task-type-detection.ts",
+  "test-repair-evidence-unlocked-transition.ts",
   "test-repair-navigation.ts",
   "test-agent-verification-controller.ts",
   "test-agent-evidence-rules.ts",

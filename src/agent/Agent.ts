@@ -354,6 +354,15 @@ Continue implementing the requested feature.`,
               );
             }
 
+            this.trace.add({
+              type: "tool",
+              iteration: progressIterations,
+              toolName: toolCall.name,
+              durationMs: 0,
+              success: false,
+              error: `${toolCall.name} rejected: verification failed and implicated files have not been inspected.`,
+            });
+
             const pathList = unreadPaths.map((p) => `  - ${p}`).join("\n");
 
             /*
@@ -496,7 +505,23 @@ Produce the final answer using the evidence already collected.`,
             toolCall.name === "read_file" &&
             typeof toolCall.arguments?.path === "string"
           ) {
-            investigation.satisfyRepairPath(toolCall.arguments.path as string);
+            const hadUnreadEvidence = investigation.hasUnreadRepairEvidence();
+            const targetPath = toolCall.arguments.path as string;
+            investigation.satisfyRepairPath(targetPath);
+
+            if (
+              hadUnreadEvidence &&
+              !investigation.hasUnreadRepairEvidence() &&
+              investigation.getTaskType() === "implementation"
+            ) {
+              messages.push({
+                role: "user",
+                content: `[REPAIR EVIDENCE SATISFIED]
+The required evidence for '${targetPath}' has now been obtained.
+The pending repair mutation is now authorized.
+Apply the targeted repair using replace_content or write_file before running verification again.`,
+              });
+            }
           }
 
           messages.push({
@@ -536,7 +561,23 @@ Choose the next implementation or verification action.`,
           toolCall.name === "read_file" &&
           typeof toolCall.arguments?.path === "string"
         ) {
-          investigation.satisfyRepairPath(toolCall.arguments.path as string);
+          const hadUnreadEvidence = investigation.hasUnreadRepairEvidence();
+          const targetPath = toolCall.arguments.path as string;
+          investigation.satisfyRepairPath(targetPath);
+
+          if (
+            hadUnreadEvidence &&
+            !investigation.hasUnreadRepairEvidence() &&
+            investigation.getTaskType() === "implementation"
+          ) {
+            messages.push({
+              role: "user",
+              content: `[REPAIR EVIDENCE SATISFIED]
+The required evidence for '${targetPath}' has now been obtained.
+The pending repair mutation is now authorized.
+Apply the targeted repair using replace_content or write_file before running verification again.`,
+            });
+          }
         }
 
         /*
@@ -1360,41 +1401,63 @@ Begin implementation now.`;
     const normalized = prompt.toLowerCase();
 
     /*
-     * Explicit planning language wins over implementation language.
+     * Explicit planning requests and constraints forbidding modification.
      */
-    const planningTerms = [
-      "implementation plan",
-      "propose",
-      "plan",
-      "how would you build",
-      "how should we build",
-      "what files",
-      "which files",
-      "do not modify any files",
-      "without modifying",
+    const explicitPlanningPatterns = [
+      /\bimplementation plan\b/,
+      /\bplan for\b/,
+      /\bplan to\b/,
+      /\bdesign plan\b/,
+      /\bpropose\b/,
+      /\bproposal\b/,
+      /\bhow would you\b/,
+      /\bhow should we\b/,
+      /\bwhat files\b/,
+      /\bwhich files\b/,
+      /\bdo not modify\b/,
+      /\bwithout modifying\b/,
+      /\bonly plan\b/,
+      /\bjust plan\b/,
+      /\bplan only\b/,
     ];
 
-    if (planningTerms.some((term) => normalized.includes(term))) {
+    if (explicitPlanningPatterns.some((pattern) => pattern.test(normalized))) {
       return "implementation-plan";
     }
 
     /*
-     * Actual implementation requests.
+     * Actual implementation and repair action requests.
      */
-    const implementationTerms = [
-      "implement",
-      "build",
-      "create",
-      "develop",
-      "add",
-      "write",
-      "modify",
-      "change",
-      "make",
+    const implementationPatterns = [
+      /\bimplement\w*\b/,
+      /\bbuild\w*\b/,
+      /\bcreate\w*\b/,
+      /\bdevelop\w*\b/,
+      /\badd\w*\b/,
+      /\bwrite\w*\b/,
+      /\bmodif\w*\b/,
+      /\bchange\w*\b/,
+      /\bmake\w*\b/,
+      /\bfix\w*\b/,
+      /\brepair\w*\b/,
+      /\bresolv\w*\b/,
+      /\bcorrect\w*\b/,
+      /\bpatch\w*\b/,
+      /\brefactor\w*\b/,
+      /\bupdate\w*\b/,
+      /\bsolve\w*\b/,
+      /\bdebug\w*\b/,
     ];
 
-    if (implementationTerms.some((term) => normalized.includes(term))) {
+    if (implementationPatterns.some((pattern) => pattern.test(normalized))) {
       return "implementation";
+    }
+
+    /*
+     * General planning words.
+     */
+    if (/\bplan\b|\bplanning\b/.test(normalized)) {
+      return "implementation-plan";
     }
 
     const existingFeatureTerms = [
@@ -1403,6 +1466,8 @@ Begin implementation now.`;
       "which file",
       "how is",
       "what does",
+      "explain how",
+      "explain why",
     ];
 
     if (existingFeatureTerms.some((term) => normalized.includes(term))) {
