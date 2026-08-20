@@ -19,6 +19,10 @@ class MockSequenceProvider implements ModelProvider {
 
   constructor(private readonly responses: ModelResponse[]) {}
 
+  getInvocationCount(): number {
+    return this.callIndex;
+  }
+
   async generate(
     messages: Message[],
     tools: ToolDefinition[],
@@ -393,6 +397,47 @@ async function testWorkspaceContainmentEnforced() {
   console.log("PASS: 6. Workspace containment remains strictly enforced");
 }
 
+async function testAgentRunnerSingleIterationLimit() {
+  const testDir = path.join(TMP_TEST_DIR, "single-iteration");
+  cleanTmpDir(testDir);
+
+  const mockProvider = new MockSequenceProvider([
+    {
+      content: "Step 1",
+      toolCalls: [{ id: "c1", name: "search_files", arguments: { query: "query1" } }],
+    },
+    {
+      content: "Step 2 should never be reached",
+      toolCalls: [],
+    },
+  ]);
+
+  const result = await runAgent({
+    prompt: "Implement complex feature in repo",
+    workspaceRoot: testDir,
+    modelProvider: mockProvider,
+    maxIterations: 1,
+  });
+
+  assert.strictEqual(
+    mockProvider.getInvocationCount(),
+    1,
+    "Mock provider must be invoked exactly once when maxIterations is 1",
+  );
+  assert.strictEqual(
+    result.iterations,
+    1,
+    "result.iterations must be exactly 1",
+  );
+  assert.strictEqual(
+    result.success,
+    false,
+    "result.success must be false when task budget expires after 1 iteration",
+  );
+
+  console.log("PASS: 7. maxIterations: 1 halts after exactly 1 model invocation with iterations=1 and success=false");
+}
+
 async function main() {
   console.log("============================================================");
   console.log("RUNNING AGENT RUNNER API DETERMINISTIC REGRESSION SUITE");
@@ -405,8 +450,9 @@ async function main() {
     await testAgentRunnerUnverifiedImplementation();
     await testAgentRunnerMaxIterationsOverride();
     await testWorkspaceContainmentEnforced();
+    await testAgentRunnerSingleIterationLimit();
 
-    console.log("\n✅ All 6 AgentRunner API test cases PASSED successfully.");
+    console.log("\n✅ All 7 AgentRunner API test cases PASSED successfully.");
   } finally {
     if (fs.existsSync(TMP_TEST_DIR)) {
       fs.rmSync(TMP_TEST_DIR, { recursive: true, force: true });
