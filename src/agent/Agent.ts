@@ -38,6 +38,8 @@ export interface AgentOptions {
 }
 
 export class Agent {
+  private lastInvestigation: InvestigationState | null = null;
+
   constructor(
     private readonly model: ModelProvider,
     private readonly tools: ToolRegistry,
@@ -46,8 +48,13 @@ export class Agent {
     private readonly options: AgentOptions = {},
   ) {}
 
+  getLastInvestigation(): InvestigationState | null {
+    return this.lastInvestigation;
+  }
+
   async run(prompt: string): Promise<string> {
     const investigation = new InvestigationState();
+    this.lastInvestigation = investigation;
     investigation.setTaskType(this.detectTaskType(prompt));
 
     const memoryEntries = this.memory.search(prompt);
