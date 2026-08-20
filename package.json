@@ -2,8 +2,13 @@
   "name": "local-ai-agent",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "dist/index.js",
+  "bin": {
+    "local-ai-agent": "./bin/local-ai-agent.js"
+  },
   "scripts": {
+    "build": "tsc",
+    "start": "tsx src/cli.ts",
     "dev": "tsx src/index.ts",
     "typecheck": "tsc --noEmit"
   },
