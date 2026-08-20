@@ -17,6 +17,18 @@ import { WriteFileTool } from "./tools/WriteFileTool.js";
 import { ReplaceContentTool } from "./tools/ReplaceContentTool.js";
 import { RunCommandTool } from "./tools/RunCommandTool.js";
 
+export { runAgent } from "./api/AgentRunner.js";
+export type {
+  AgentRunOptions,
+  AgentRunResult,
+  VerificationSummary,
+} from "./api/types.js";
+export { Agent } from "./agent/Agent.js";
+export { OllamaProvider } from "./models/OllamaProvider.js";
+export { Workspace } from "./workspace/Workspace.js";
+export { ToolRegistry } from "./tools/ToolRegistry.js";
+export { ExecutionTrace } from "./observability/ExecutionTrace.js";
+
 async function main(): Promise<void> {
   const prompt = process.argv.slice(2).join(" ");
 
@@ -90,7 +102,15 @@ async function main(): Promise<void> {
   await browser.close();
 }
 
-main().catch((error: unknown) => {
-  console.error("Agent failed:", error);
-  process.exitCode = 1;
-});
+const isMain =
+  process.argv[1] &&
+  (process.argv[1].endsWith("src/index.ts") ||
+    process.argv[1].endsWith("src/index.js") ||
+    process.argv[1].endsWith("local-ai-agent/index.js"));
+
+if (isMain) {
+  main().catch((error: unknown) => {
+    console.error("Agent failed:", error);
+    process.exitCode = 1;
+  });
+}
