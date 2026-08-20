@@ -110,18 +110,6 @@ npm run build
 
 This compiles TypeScript source from `src/` to `dist/` and prepares the executable binary wrapper at `bin/local-ai-agent.js`.
 
-From this checkout, run the wrapper with `./` from the repository root:
-
-```bash
-./bin/local-ai-agent.js --help
-```
-
-To make `local-ai-agent` available as a command in any directory during local development, link the package once:
-
-```bash
-npm link
-```
-
 ---
 
 ## 7. CLI Usage
@@ -129,21 +117,19 @@ npm link
 The package exposes the `local-ai-agent` executable:
 
 ```bash
-# Basic invocation from this repository (targets the current working directory)
-./bin/local-ai-agent.js "Fix the failing tests in src/tests/todo.test.ts"
+# Basic invocation on current working directory
+local-ai-agent "Fix the failing tests in src/tests/todo.test.ts"
 
 # Target an external workspace
-./bin/local-ai-agent.js --workspace ./my-project "Fix TypeScript compiler errors"
+local-ai-agent --workspace ./my-project "Fix TypeScript compiler errors"
 
 # Override default model or iteration ceiling
-./bin/local-ai-agent.js --model qwen2.5-coder:14b --max-iterations 25 "Refactor task service"
+local-ai-agent --model qwen2.5-coder:14b --max-iterations 25 "Refactor task service"
 
 # Show help or version
-./bin/local-ai-agent.js --help
-./bin/local-ai-agent.js --version
+local-ai-agent --help
+local-ai-agent --version
 ```
-
-After `npm link`, you can omit `./bin/` and use `local-ai-agent` directly.
 
 ### Supported CLI Flags:
 - `-w, --workspace <path>`: Target workspace directory (default: current directory).
@@ -270,13 +256,11 @@ npm run typecheck
 # Build distribution files
 npm run build
 
-# Run deterministic regression test suites (no LLM required)
-npx tsx src/tests/test-cli.ts
-npx tsx src/tests/test-agent-runner-api.ts
-npx tsx src/tests/test-agent-verification-controller.ts
-npx tsx src/tests/test-repair-navigation.ts
-npx tsx src/tests/test-replace-content-tool.ts
+# Run all 28 deterministic unit and regression test suites
+npm test
 ```
+
+All 28 deterministic test suites in `src/tests/` run in sub-process sandboxes using mock model sequences without requiring a live Ollama service.
 
 ---
 

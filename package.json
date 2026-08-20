@@ -10,7 +10,8 @@
     "build": "tsc",
     "start": "tsx src/cli.ts",
     "dev": "tsx src/index.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx src/tests/run-all-tests.ts"
   },
   "keywords": [],
   "author": "",
