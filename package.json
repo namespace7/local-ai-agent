@@ -6,6 +6,13 @@
   "bin": {
     "local-ai-agent": "./bin/local-ai-agent.js"
   },
+  "files": [
+    "bin",
+    "dist",
+    "!dist/tests",
+    "!dist/tools/test-workspace.*",
+    "README.md"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "tsx src/cli.ts",
