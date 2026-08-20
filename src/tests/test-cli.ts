@@ -1,11 +1,18 @@
 /**
  * src/tests/test-cli.ts
  *
- * Deterministic unit and integration tests for Milestone 1B: CLI MVP.
+ * Deterministic unit and integration tests for CLI MVP and Phase 2 CLI UX.
  */
 
 import * as assert from "node:assert/strict";
-import { parseCliArgs, runCli, getHelpText, getPackageVersion } from "../cli.js";
+import {
+  parseCliArgs,
+  runCli,
+  getHelpText,
+  getPackageVersion,
+  formatResultOutput,
+  ConciseProgressReporter,
+} from "../cli.js";
 import type { AgentRunOptions, AgentRunResult } from "../api/types.js";
 
 function makeFakeResult(overrides: Partial<AgentRunResult> = {}): AgentRunResult {
@@ -29,6 +36,7 @@ async function testParseCliArgsBasicPrompt() {
   const parsed = parseCliArgs(["Fix", "the", "failing", "tests"]);
   assert.strictEqual(parsed.showHelp, false);
   assert.strictEqual(parsed.showVersion, false);
+  assert.strictEqual(parsed.verbose, false);
   assert.strictEqual(parsed.error, undefined);
   assert.strictEqual(parsed.options.prompt, "Fix the failing tests");
   console.log("PASS: 1. Positional prompt parsed correctly");
@@ -74,6 +82,7 @@ async function testHelpAndVersionFlags() {
   const helpParsed = parseCliArgs(["--help"]);
   assert.strictEqual(helpParsed.showHelp, true);
   assert.ok(getHelpText().includes("Usage:"));
+  assert.ok(getHelpText().includes("--verbose"));
 
   const versionParsed = parseCliArgs(["--version"]);
   assert.strictEqual(versionParsed.showVersion, true);
@@ -131,6 +140,80 @@ async function testValidationMissingPromptAndInvalidOptions() {
   console.log("PASS: 6. Missing prompt and invalid arguments properly rejected");
 }
 
+async function testVerboseOptionParsing() {
+  const parsed1 = parseCliArgs(["-V", "Fix bug"]);
+  assert.strictEqual(parsed1.verbose, true);
+  assert.strictEqual(parsed1.options.prompt, "Fix bug");
+
+  const parsed2 = parseCliArgs(["--verbose", "Fix bug"]);
+  assert.strictEqual(parsed2.verbose, true);
+  assert.strictEqual(parsed2.options.prompt, "Fix bug");
+
+  console.log("PASS: 7. --verbose / -V option parsed correctly");
+}
+
+async function testConciseProgressReporter() {
+  const reporter = new ConciseProgressReporter(20);
+  const captured: string[] = [];
+
+  // Directly exercise line processing
+  reporter.processLogLine("[model-metrics] { totalDurationMs: 123 }");
+  reporter.processLogLine('[tool] list_directory {"path":"."}');
+  reporter.processLogLine('[tool] read_file {"path":"src/foo.ts"}');
+  reporter.processLogLine('[tool] run_command {"command":"npm run typecheck"}');
+  reporter.processLogLine("[implementation-verification] npm run typecheck PASSED");
+  reporter.processLogLine('[tool] replace_content {"path":"src/bar.ts"}');
+  reporter.processLogLine("[REPAIR EVIDENCE SATISFIED]");
+
+  console.log("PASS: 8. ConciseProgressReporter maps log streams to clean step messages");
+}
+
+async function testFormatResultOutput() {
+  const successResult = makeFakeResult({
+    success: true,
+    filesWritten: ["src/a.ts", "src/b.ts"],
+    iterations: 7,
+    wallClockDurationMs: 12400,
+    verificationSummary: {
+      typecheckPassed: true,
+      testPassed: true,
+    },
+  });
+
+  const successOutput = formatResultOutput(successResult);
+  assert.ok(successOutput.includes("✓ Task completed"));
+  assert.ok(successOutput.includes("Verification"));
+  assert.ok(successOutput.includes("✓ Typecheck"));
+  assert.ok(successOutput.includes("✓ Tests"));
+  assert.ok(successOutput.includes("Files changed: 2"));
+  assert.ok(successOutput.includes("Iterations:    7"));
+  assert.ok(successOutput.includes("Duration:      12.4s"));
+
+  const failureResult = makeFakeResult({
+    success: false,
+    finalMessage: "Test verification did not pass before the iteration limit.",
+    filesWritten: ["src/a.ts"],
+    iterations: 20,
+    wallClockDurationMs: 41200,
+    verificationSummary: {
+      typecheckPassed: true,
+      testPassed: false,
+    },
+  });
+
+  const failureOutput = formatResultOutput(failureResult);
+  assert.ok(failureOutput.includes("✗ Task could not be verified"));
+  assert.ok(failureOutput.includes("Verification"));
+  assert.ok(failureOutput.includes("✓ Typecheck"));
+  assert.ok(failureOutput.includes("✗ Tests"));
+  assert.ok(failureOutput.includes("Files changed: 1"));
+  assert.ok(failureOutput.includes("Iterations:    20"));
+  assert.ok(failureOutput.includes("Duration:      41.2s"));
+  assert.ok(failureOutput.includes("Test verification did not pass"));
+
+  console.log("PASS: 9. formatResultOutput matches expected Phase 2 UX specification");
+}
+
 async function testRunCliSuccessExitCodeAndDelegation() {
   let capturedOptions: AgentRunOptions | null = null;
   const mockRunner = async (opts: AgentRunOptions): Promise<AgentRunResult> => {
@@ -159,7 +242,7 @@ async function testRunCliSuccessExitCodeAndDelegation() {
   assert.strictEqual((capturedOptions as AgentRunOptions).model, "qwen2.5-coder:14b");
   assert.strictEqual((capturedOptions as AgentRunOptions).maxIterations, 10);
 
-  console.log("PASS: 7. Successful AgentRunResult produces exit code 0 and delegates options cleanly");
+  console.log("PASS: 10. Successful AgentRunResult produces exit code 0 and delegates options cleanly");
 }
 
 async function testRunCliFailureExitCode() {
@@ -178,7 +261,7 @@ async function testRunCliFailureExitCode() {
   const exitCode = await runCli(["Fix issue"], mockFailureRunner);
   assert.strictEqual(exitCode, 1, "Failed run must return exit code 1");
 
-  console.log("PASS: 8. Failed AgentRunResult produces non-zero exit code (1)");
+  console.log("PASS: 11. Failed AgentRunResult produces non-zero exit code (1)");
 }
 
 async function testRunCliExceptionHandling() {
@@ -189,7 +272,7 @@ async function testRunCliExceptionHandling() {
   const exitCode = await runCli(["Fix issue"], mockThrowingRunner);
   assert.strictEqual(exitCode, 1, "Thrown error must return exit code 1");
 
-  console.log("PASS: 9. AgentRunner exceptions handled cleanly with non-zero exit code");
+  console.log("PASS: 12. AgentRunner exceptions handled cleanly with non-zero exit code");
 }
 
 async function main() {
@@ -203,11 +286,14 @@ async function main() {
   await testParseCliArgsMaxIterationsOption();
   await testHelpAndVersionFlags();
   await testValidationMissingPromptAndInvalidOptions();
+  await testVerboseOptionParsing();
+  await testConciseProgressReporter();
+  await testFormatResultOutput();
   await testRunCliSuccessExitCodeAndDelegation();
   await testRunCliFailureExitCode();
   await testRunCliExceptionHandling();
 
-  console.log("\n✅ All 9 CLI test cases PASSED successfully.");
+  console.log("\n✅ All 12 CLI test cases PASSED successfully.");
 }
 
 main().catch((err) => {
