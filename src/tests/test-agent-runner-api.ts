@@ -13,7 +13,7 @@ import type { Message, ModelResponse, ToolDefinition } from "../models/types.js"
 
 const TMP_TEST_DIR = path.resolve("./tmp-test-agent-runner");
 
-class MockSequenceProvider implements ModelProvider {
+export class MockSequenceProvider implements ModelProvider {
   private callIndex = 0;
   public capturedModels: string[] = [];
 

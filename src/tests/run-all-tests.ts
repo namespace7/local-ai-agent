@@ -16,6 +16,7 @@ const DETERMINISTIC_TEST_FILES = [
   "test-cli.ts",
   "test-agent-runner-api.ts",
   "test-agent-task-type-detection.ts",
+  "test-greenfield-investigation.ts",
   "test-repair-evidence-unlocked-transition.ts",
   "test-repair-navigation.ts",
   "test-agent-verification-controller.ts",
@@ -43,6 +44,8 @@ const DETERMINISTIC_TEST_FILES = [
   "test-remember-tool.ts",
   "test-search-files.ts",
   "test-tool-registry.ts",
+    "test-greenfield-investigation-prompt.ts",
+  "test-tool-payload-format-guidance.ts",
 ];
 
 function cleanupTempArtifacts() {

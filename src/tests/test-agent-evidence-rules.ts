@@ -153,10 +153,8 @@ const agent = new Agent(model, tools, trace, memory);
 
 await agent.run("Build a new feature in local-ai-agent");
 
-// Check captured system prompts across iterations:
-// After search_files (Iteration 1 system prompt): Configuration MUST STILL BE missing
 const systemPromptAfterSearch = capturedSystemPrompts[1];
-if (!systemPromptAfterSearch?.includes("- Configuration: missing")) {
+if (!systemPromptAfterSearch?.includes("project configuration")) {
   throw new Error(
     "FAIL: Configuration evidence was marked complete after search_files, but it must remain missing until read_file(package.json) is executed!",
   );
@@ -164,7 +162,7 @@ if (!systemPromptAfterSearch?.includes("- Configuration: missing")) {
 
 // After list_directory (Iteration 2 system prompt): Configuration MUST STILL BE missing
 const systemPromptAfterList = capturedSystemPrompts[2];
-if (!systemPromptAfterList?.includes("- Configuration: missing")) {
+if (!systemPromptAfterList?.includes("project configuration")) {
   throw new Error(
     "FAIL: Configuration evidence was marked complete before read_file(package.json)!",
   );
@@ -172,7 +170,7 @@ if (!systemPromptAfterList?.includes("- Configuration: missing")) {
 
 // After read_file package.json (Iteration 3 system prompt): Configuration MUST BE complete
 const systemPromptAfterRead = capturedSystemPrompts[3];
-if (!systemPromptAfterRead?.includes("- Configuration: complete")) {
+if (systemPromptAfterRead?.includes("project configuration")) {
   throw new Error(
     "FAIL: Configuration evidence was not marked complete after read_file(package.json)!",
   );

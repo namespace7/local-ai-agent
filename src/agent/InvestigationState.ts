@@ -1,3 +1,7 @@
+export type SpecificationSource =
+  | { type: "file"; path: string }
+  | { type: "user_prompt" };
+
 export type InvestigationTaskType =
   | "factual"
   | "existing-feature"
@@ -63,6 +67,34 @@ export class InvestigationState {
    * Cleared when any verification command succeeds.
    */
   private readonly unreadRepairPaths = new Set<string>();
+
+  private greenfieldDetected = false;
+  private specificationEstablished = false;
+  private specificationSource?: SpecificationSource;
+
+  markGreenfieldDetected(detected = true): void {
+    this.greenfieldDetected = detected;
+  }
+
+  isGreenfield(): boolean {
+    return this.greenfieldDetected;
+  }
+
+  setSpecificationSource(source: SpecificationSource): void {
+    this.specificationSource = source;
+  }
+
+  getSpecificationSource(): SpecificationSource | undefined {
+    return this.specificationSource;
+  }
+
+  markSpecificationEstablished(): void {
+    this.specificationEstablished = true;
+  }
+
+  hasSpecificationBeenEstablished(): boolean {
+    return this.specificationEstablished;
+  }
 
   recordInspectedFile(path: string): void {
     if (!this.implementation.inspectedFiles.includes(path)) {
@@ -250,18 +282,21 @@ export class InvestigationState {
       cmdSuccess = Boolean(success);
     }
 
-    if (cmdSuccess && cmdName.length > 0) {
+    if (cmdName.length > 0) {
       const category = this.classifyCommand(cmdName);
-      if (
-        category &&
-        !this.implementation.completedCategories.includes(category)
-      ) {
-        if (category === "test") {
-          if (this.hasValidTestEvidence()) {
+      if (category) {
+        this.addRequiredCategory(category);
+        if (
+          cmdSuccess &&
+          !this.implementation.completedCategories.includes(category)
+        ) {
+          if (category === "test") {
+            if (this.hasValidTestEvidence()) {
+              this.implementation.completedCategories.push(category);
+            }
+          } else {
             this.implementation.completedCategories.push(category);
           }
-        } else {
-          this.implementation.completedCategories.push(category);
         }
       }
     }
@@ -449,6 +484,14 @@ export class InvestigationState {
       this.taskType === "implementation-plan" ||
       this.taskType === "implementation"
     ) {
+      if (this.greenfieldDetected) {
+        return (
+          this.evidence.featureSearchCompleted &&
+          this.evidence.repositoryStructureInspected &&
+          this.specificationEstablished
+        );
+      }
+
       return (
         this.evidence.featureSearchCompleted &&
         this.evidence.repositoryStructureInspected &&
@@ -470,6 +513,13 @@ export class InvestigationState {
 
     if (!this.evidence.repositoryStructureInspected) {
       missing.push("repository structure");
+    }
+
+    if (this.greenfieldDetected) {
+      if (!this.specificationEstablished) {
+        missing.push("project specification");
+      }
+      return missing;
     }
 
     if (!this.evidence.configurationInspected) {
@@ -523,16 +573,6 @@ export class InvestigationState {
       `- Feature search: ${
         evidence.featureSearchCompleted ? "complete" : "missing"
       }`,
-      `- Repository structure: ${
-        evidence.repositoryStructureInspected ? "complete" : "missing"
-      }`,
-      `- Configuration: ${
-        evidence.configurationInspected ? "complete" : "missing"
-      }`,
-      `- Implementation: ${
-        evidence.implementationInspected ? "complete" : "missing"
-      }`,
-      `- Tests: ${evidence.testsInspected ? "complete" : "missing"}`,
     ].join("\n");
 
     const implementation = this.getImplementationState();
@@ -601,6 +641,30 @@ export class InvestigationState {
         '- Inspect the repository root with list_directory({ path: "." }).',
         "- Then inspect only directories relevant to the requested feature.",
       ].join("\n");
+    }
+
+    if (this.greenfieldDetected) {
+      if (!this.specificationEstablished) {
+        return [
+          "Next investigation priority: project specification.",
+          "- Greenfield repository detected with no existing code or configuration.",
+          "- You MUST read the discovered specification file (e.g., REQUIREMENTS.md) via read_file before proceeding.",
+          "- Do NOT call read_file on package.json, tsconfig.json, or source files because they do not exist yet.",
+        ].join("\n");
+      }
+
+      if (this.taskType === "implementation") {
+        if (!this.implementation.started) {
+          return [
+            "Investigation is complete.",
+            "",
+            "Next phase: implementation (greenfield project).",
+            "- Create project configuration (package.json, tsconfig.json), source files, and tests according to the specification.",
+            "- Use write_file to create the required files.",
+            "- Actually implement the user's requested application.",
+          ].join("\n");
+        }
+      }
     }
 
     if (!this.evidence.configurationInspected) {

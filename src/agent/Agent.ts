@@ -609,6 +609,19 @@ Apply the targeted repair using replace_content or write_file before running ver
 
             investigation.recordWrittenFile(result.path, content);
 
+            const lowerPath = result.path.toLowerCase();
+            if (lowerPath.endsWith("tsconfig.json")) {
+              investigation.addRequiredCategory("typecheck");
+            }
+            if (lowerPath.endsWith("package.json") && content) {
+              if (content.includes("tsconfig.json") || content.includes('"typecheck"')) {
+                investigation.addRequiredCategory("typecheck");
+              }
+              if (content.includes('"test"')) {
+                investigation.addRequiredCategory("test");
+              }
+            }
+
             console.log("[implementation-write]", result.path);
           }
         }
@@ -810,6 +823,20 @@ Do NOT call list_directory or read_file until search_files has executed.
 ${investigation.getContext()}`;
     }
 
+    if (investigation.isGreenfield() && !investigation.hasSpecificationBeenEstablished()) {
+      return `REJECTED TOOL CALL: ${toolName} is not allowed at this step.
+
+        Reason:
+        ${policyReason}
+
+        REQUIRED NEXT ACTION:
+        This is a greenfield repository. You must inspect the project specification before implementing.
+        Call:
+        read_file({"path": "REQUIREMENTS.md"})
+
+        ${investigation.getContext()}`;
+    }
+
     return `REJECTED TOOL CALL: ${toolName} is not allowed at this step.
 
 Reason:
@@ -857,6 +884,74 @@ Do not repeat the rejected tool call.`;
     prompt: string,
     investigation: InvestigationState,
   ): string {
+    if (investigation.isGreenfield()) {
+      return `[GREENFIELD REPOSITORY]
+The repository contains no existing application implementation.
+
+**GREENFIELD INVESTIGATION SEQUENCE**
+1. Use \`search_files\` exactly once to establish feature/requirements evidence.
+2. Then use \`list_directory(".")\` to inspect the workspace root.
+3. Then use \`read_file(\"REQUIREMENTS.md\")\` to inspect the specification.
+4. After \`REQUIREMENTS.md\` has been successfully read, stop investigating and begin implementation.
+5. Do NOT repeat \`search_files\` after the feature‑search evidence has been collected.
+6. Do NOT call \`list_directory\` or \`read_file\` before the required preceding step.
+7. The controller will reject duplicate investigation calls.
+
+The user's request is:
+
+${prompt}
+
+You are now in the IMPLEMENTATION phase.
+
+Do not produce a plan instead of implementing.
+
+Actually create and implement the application in the workspace. Use write_file to create the necessary configuration (e.g. package.json, tsconfig.json), source files, and tests described in REQUIREMENTS.md.
+
+IMPLEMENTATION TOOL FORMAT RULES
+
+When calling a tool, emit ONLY the structured tool call as defined by the tool interface.
+
+For write_file:
+
+You are now in the IMPLEMENTATION phase.
+
+Do not produce a plan instead of implementing.
+
+Actually create and implement the application in the workspace. Use write_file to create the necessary configuration (e.g. package.json, tsconfig.json), source files, and tests described in REQUIREMENTS.md.
+
+IMPLEMENTATION TOOL FORMAT RULES
+
+When calling a tool, emit ONLY the structured tool call as defined by the tool interface.
+
+For write_file:
+- \`path\` must be a JSON string.
+- \`content\` must be a JSON string containing the file contents.
+- Encode newlines using JSON escapes (e.g. \\n).
+- Do NOT use JSON.stringify().
+- Do NOT embed JavaScript expressions or template literals/\`backticks\`.
+- Do NOT wrap the tool call in markdown code fences.
+- Malformed tool calls will be rejected.
+
+Example:
+{
+  "name": "write_file",
+  "arguments": {
+    "path": "hello.ts",
+    "content": "export const hello = 'world';\n"
+  }
+}
+
+Implementation rules:
+1. Build the complete application architecture specified in REQUIREMENTS.md.
+2. Use write_file to create the project configuration, source files, and tests.
+3. Establish verification for the project (e.g. run 'npm run typecheck' or 'npm test' or the build/test commands appropriate to the project).
+4. If verification fails, inspect the stdout/stderr output and repair the implementation using replace_content or write_file.
+5. Do not stop merely after creating a plan or describing what you would do.
+6. Continue using tools until verification succeeds.
+
+Begin implementation now.`;
+    }
+
     return `Repository investigation is complete.
 
 ${investigation.getContext()}
@@ -1004,6 +1099,27 @@ Begin implementation now.`;
     }
 
     /*
+     * GREENFIELD INVESTIGATION PATH:
+     * When an empty / greenfield repository is detected, the model must read
+     * REQUIREMENTS.md to inspect project specifications.
+     */
+    if (investigation.isGreenfield()) {
+      if (!investigation.hasSpecificationBeenEstablished()) {
+        // Allow reading a markdown file as the specification in a greenfield repository.
+        if (toolName === "read_file" && typeof argumentsValue.path === "string" && argumentsValue.path.toLowerCase().endsWith(".md")) {
+          investigation.setSpecificationSource({ type: "file", path: argumentsValue.path as string });
+          investigation.markSpecificationEstablished();
+          return { allowed: true };
+        }
+        return {
+          allowed: false,
+          reason: "Specification not yet established for greenfield repository.",
+        };
+      }
+      // Specification already established – proceed with normal checks
+    }
+
+    /*
      * Configuration.
      */
     if (!evidence.configurationInspected) {
@@ -1090,6 +1206,110 @@ Begin implementation now.`;
     };
   }
 
+
+
+  /**
+   * Evaluate whether a repository root directory listing indicates a greenfield project.
+   *
+   * A repository is greenfield if it contains NO existing configuration, NO source/implementation
+   * folders, NO test folders, and NO source code files, but contains REQUIREMENTS.md
+   * (or only documentation/requirements files).
+   */
+  private evaluateGreenfieldRepository(entries: unknown): boolean {
+    if (!Array.isArray(entries)) {
+      return false;
+    }
+
+    const ignoredNames = new Set([
+      ".git",
+      ".gitignore",
+      ".agent-memory.json",
+      ".memory.json",
+      ".ds_store",
+      ".npmignore",
+    ]);
+
+    const activeEntries = entries.filter((e) => {
+      const name = (typeof e?.name === "string" ? e.name : "").toLowerCase();
+      return name.length > 0 && !ignoredNames.has(name);
+    });
+
+    if (activeEntries.length === 0) {
+      return true;
+    }
+
+    for (const entry of activeEntries) {
+      const name = (typeof entry?.name === "string" ? entry.name : "").toLowerCase();
+
+      if (name === "requirements.md" || name.endsWith("/requirements.md")) {
+        continue;
+      }
+
+      if (name === "readme.md" || name.endsWith(".md") || name.endsWith(".txt")) {
+        continue;
+      }
+
+      // Check for configuration files
+      if (
+        name === "package.json" ||
+        name === "tsconfig.json" ||
+        name === "package-lock.json" ||
+        name === "pyproject.toml" ||
+        name === "cargo.toml" ||
+        name === "go.mod" ||
+        name === "pom.xml" ||
+        name === "build.gradle" ||
+        name === "composer.json" ||
+        name === "makefile"
+      ) {
+        return false;
+      }
+
+      // Check for implementation / test directories
+      if (
+        name === "src" ||
+        name === "lib" ||
+        name === "app" ||
+        name === "tests" ||
+        name === "test" ||
+        name === "__tests__" ||
+        name === "dist" ||
+        name === "pkg" ||
+        name === "cmd" ||
+        name === "internal" ||
+        name === "models" ||
+        name === "services" ||
+        name === "controllers" ||
+        name === "repositories"
+      ) {
+        return false;
+      }
+
+      // Check for code files
+      if (
+        name.endsWith(".ts") ||
+        name.endsWith(".tsx") ||
+        name.endsWith(".js") ||
+        name.endsWith(".jsx") ||
+        name.endsWith(".mjs") ||
+        name.endsWith(".cjs") ||
+        name.endsWith(".py") ||
+        name.endsWith(".go") ||
+        name.endsWith(".rs") ||
+        name.endsWith(".java") ||
+        name.endsWith(".rb") ||
+        name.endsWith(".php") ||
+        name.endsWith(".c") ||
+        name.endsWith(".cpp") ||
+        name.endsWith(".h")
+      ) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
   private isConfigurationPath(path: unknown): boolean {
     if (typeof path !== "string") {
       return false;
@@ -1146,7 +1366,7 @@ Begin implementation now.`;
       return false;
     }
 
-    if (this.isConfigurationPath(normalized)) {
+    if (this.isConfigurationPath(normalized) || normalized.endsWith('.md')) {
       return false;
     }
 
@@ -1182,6 +1402,12 @@ Begin implementation now.`;
       investigation.markRepositoryStructureInspected();
       investigation.recordPath(path);
 
+      if (path === "." || path === "" || path === "./") {
+        if (this.evaluateGreenfieldRepository(result)) {
+          investigation.markGreenfieldDetected(true);
+        }
+      }
+
       return;
     }
 
@@ -1192,54 +1418,58 @@ Begin implementation now.`;
       if (path.length === 0) {
         return;
       }
-
       investigation.recordPath(path);
 
       const normalizedPath = path.toLowerCase();
 
+      // If a specification source was discovered and this file matches it, mark as established
+      const specSource = investigation.getSpecificationSource();
+      if (!investigation.hasSpecificationBeenEstablished() && specSource?.type === "file" && specSource.path.toLowerCase() === path.toLowerCase()) {
+        investigation.setSpecificationSource({ type: "file", path });
+        investigation.markSpecificationEstablished();
+        return;
+      }
+
       if (this.isConfigurationPath(path)) {
         investigation.markConfigurationInspected();
+      }
 
-        const lowerPath = path.toLowerCase();
-        if (lowerPath.endsWith("tsconfig.json")) {
+      const lowerPath = path.toLowerCase();
+      if (lowerPath.endsWith("tsconfig.json")) {
+        investigation.addRequiredCategory("typecheck");
+      }
+
+      if (lowerPath.endsWith("package.json")) {
+        const content =
+          result !== null &&
+          typeof result === "object" &&
+          typeof (result as any).content === "string"
+            ? ((result as any).content as string)
+            : "";
+
+        if (content.includes("tsconfig.json") || content.includes('"typecheck"')) {
           investigation.addRequiredCategory("typecheck");
         }
 
-        if (lowerPath.endsWith("package.json")) {
-          const content =
-            result !== null &&
-            typeof result === "object" &&
-            typeof (result as any).content === "string"
-              ? ((result as any).content as string)
-              : "";
 
-          if (content.includes("tsconfig.json") || content.includes('"typecheck"')) {
-            investigation.addRequiredCategory("typecheck");
-          }
-          if (content.includes('"test"')) {
-            investigation.addRequiredCategory("test");
-          }
-        }
-        return;
       }
 
       if (this.isTestPath(normalizedPath)) {
         investigation.markTestsInspected();
         investigation.addRequiredCategory("test");
-        return;
       }
 
       if (
-        normalizedPath === "readme.md" ||
-        normalizedPath.endsWith("/readme.md") ||
-        normalizedPath.endsWith(".md")
+        normalizedPath === 'readme.md' ||
+        normalizedPath.endsWith('/readme.md') ||
+        normalizedPath.endsWith('.md')
       ) {
-        return;
-      }
-
-      if (this.isImplementationPath(normalizedPath)) {
+        // No further evidence needed for generic markdown files
+      } else if (this.isImplementationPath(normalizedPath)) {
         investigation.markImplementationInspected();
       }
+      // End of read_file handling
+      return;
     }
   }
 
@@ -1414,8 +1644,8 @@ Begin implementation now.`;
       /\bhow should we\b/,
       /\bwhat files\b/,
       /\bwhich files\b/,
-      /\bdo not modify\b/,
-      /\bwithout modifying\b/,
+      /\bdo not modify (?:the )?(?:code|repository|workspace|files|anything)\b/,
+      /\bwithout modifying (?:the )?(?:code|repository|workspace|files|anything)\b/,
       /\bonly plan\b/,
       /\bjust plan\b/,
       /\bplan only\b/,
