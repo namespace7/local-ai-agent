@@ -1105,12 +1105,18 @@ Begin implementation now.`;
      */
     if (investigation.isGreenfield()) {
       if (!investigation.hasSpecificationBeenEstablished()) {
-        // Allow reading a markdown file as the specification in a greenfield repository.
-        if (toolName === "read_file" && typeof argumentsValue.path === "string" && argumentsValue.path.toLowerCase().endsWith(".md")) {
-          investigation.setSpecificationSource({ type: "file", path: argumentsValue.path as string });
-          investigation.markSpecificationEstablished();
-          return { allowed: true };
+        const specSource = investigation.getSpecificationSource();
+        // If there's a discovered file source, allow reading it
+        if (specSource?.type === "file") {
+          if (toolName === "read_file" && typeof argumentsValue.path === "string" && argumentsValue.path.toLowerCase() === specSource.path.toLowerCase()) {
+            return { allowed: true }; // establishment happens AFTER read_file completes successfully
+          }
+          return {
+            allowed: false,
+            reason: `Specification not yet established for greenfield repository. You must read ${specSource.path} first.`,
+          };
         }
+
         return {
           allowed: false,
           reason: "Specification not yet established for greenfield repository.",
@@ -1301,7 +1307,11 @@ Begin implementation now.`;
         name.endsWith(".php") ||
         name.endsWith(".c") ||
         name.endsWith(".cpp") ||
-        name.endsWith(".h")
+        name.endsWith(".h") ||
+        name.endsWith(".html") ||
+        name.endsWith(".htm") ||
+        name.endsWith(".css") ||
+        name.endsWith(".scss")
       ) {
         return false;
       }
@@ -1309,6 +1319,41 @@ Begin implementation now.`;
 
     return true;
   }
+
+  private discoverSpecification(entries: unknown): { type: "file"; path: string } | { type: "user_prompt" } {
+    if (!Array.isArray(entries)) {
+      return { type: "user_prompt" };
+    }
+
+    const candidateRanking = [
+      "requirements.md",
+      "spec.md",
+      "specification.md",
+      "product_spec.md",
+      "product-requirements.md",
+      "task.md",
+      "docs/requirements.md",
+      "docs/spec.md",
+      "docs/specification.md",
+    ];
+
+    const actualFiles = new Map<string, string>();
+    for (const entry of entries) {
+      const name = typeof entry?.name === "string" ? entry.name : "";
+      if (name) {
+        actualFiles.set(name.toLowerCase(), name);
+      }
+    }
+
+    for (const candidate of candidateRanking) {
+      if (actualFiles.has(candidate)) {
+        return { type: "file", path: actualFiles.get(candidate)! };
+      }
+    }
+
+    return { type: "user_prompt" };
+  }
+
 
   private isConfigurationPath(path: unknown): boolean {
     if (typeof path !== "string") {
@@ -1405,6 +1450,15 @@ Begin implementation now.`;
       if (path === "." || path === "" || path === "./") {
         if (this.evaluateGreenfieldRepository(result)) {
           investigation.markGreenfieldDetected(true);
+
+          if (!investigation.getSpecificationSource()) {
+            const specSource = this.discoverSpecification(result);
+            investigation.setSpecificationSource(specSource);
+
+            if (specSource.type === "user_prompt") {
+              investigation.markSpecificationEstablished();
+            }
+          }
         }
       }
 

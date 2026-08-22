@@ -306,6 +306,46 @@ async function testGreenfieldAutonomousTransitionAndImplementation() {
   console.log("PASS: E. Greenfield project successfully inspected and autonomously implemented");
 }
 
+async function testIndexHtmlProtection() {
+  console.log("TEST F: Repository with index.html protection against greenfield classification");
+  const testDir = path.join(TMP_TEST_DIR, "html-repo");
+  fs.mkdirSync(testDir, { recursive: true });
+  fs.writeFileSync(path.join(testDir, "README.md"), "# HTML Project\n");
+  fs.writeFileSync(path.join(testDir, "index.html"), "<html></html>\n");
+  fs.mkdirSync(path.join(testDir, ".github"));
+
+  const model = new FakeModelProvider([
+    // Step 1: search_files to satisfy initial requirement
+    { content: "", toolCalls: [{ id: "c1", name: "search_files", arguments: { query: "Improve" } }] },
+    // Step 2: list_directory (detects if it's greenfield)
+    { content: "", toolCalls: [{ id: "c2", name: "list_directory", arguments: { path: "." } }] },
+    // Step 3: Finish
+    { content: "done", toolCalls: [] }
+  ]);
+
+  const workspace = new Workspace(testDir);
+  const tools = new ToolRegistry();
+  tools.register(new ListDirectoryTool(workspace));
+  tools.register(new ReadFileTool(workspace));
+  tools.register(new SearchFilesTool(workspace));
+  tools.register(new WriteFileTool(workspace));
+
+  const trace = new ExecutionTrace();
+  const memory = new ProjectMemory(path.join(testDir, ".memory.json"));
+
+  const agent = new Agent(model, tools, trace, memory, {
+    workspaceRoot: testDir,
+    maxIterations: 3,
+  });
+  await agent.run("Improve the project");
+
+  const lastInvestigation = agent.getLastInvestigation();
+  assert.ok(lastInvestigation);
+  assert.strictEqual(lastInvestigation.isGreenfield(), false, "Repository with index.html must NOT be classified as greenfield");
+
+  console.log("PASS: F. Repository with index.html correctly preserves existing-repo rules");
+}
+
 async function main() {
   console.log("============================================================");
   console.log("RUNNING GREENFIELD INVESTIGATION DETERMINISTIC REGRESSION SUITE");
@@ -318,8 +358,10 @@ async function main() {
     await testGreenfieldRejectionOfNonexistentArtifacts();
     await testExistingRepositoryProtection();
     await testGreenfieldAutonomousTransitionAndImplementation();
+    await testIndexHtmlProtection();
+    await testGreenfieldDiscoveryRanking();
 
-    console.log("\n✅ All greenfield investigation test cases (A-E) PASSED successfully.");
+    console.log("\n✅ All greenfield investigation test cases (A-G) PASSED successfully.");
   } finally {
     if (fs.existsSync(TMP_TEST_DIR)) {
       fs.rmSync(TMP_TEST_DIR, { recursive: true, force: true });
@@ -331,3 +373,88 @@ main().catch((err) => {
   console.error("Test Failed:", err);
   process.exit(1);
 });
+async function testGreenfieldDiscoveryRanking() {
+  console.log("TEST G: Greenfield specification discovery ranking and semantics");
+
+  // Helper to run a single list_directory step and return state
+  const checkDiscovery = async (name: string, files: string[]) => {
+    const testDir = path.join(TMP_TEST_DIR, name);
+    fs.mkdirSync(testDir, { recursive: true });
+
+    for (const f of files) {
+      const p = path.join(testDir, f);
+      fs.mkdirSync(path.dirname(p), { recursive: true });
+      if (f.endsWith("/")) {
+        fs.mkdirSync(p, { recursive: true });
+      } else {
+        fs.writeFileSync(p, "# Content\n");
+      }
+    }
+
+    const model = new FakeModelProvider([
+      { content: "", toolCalls: [{ id: "c1", name: "search_files", arguments: { query: "Improve" } }] },
+      { content: "", toolCalls: [{ id: "c2", name: "list_directory", arguments: { path: "." } }] },
+      { content: "done", toolCalls: [] }
+    ]);
+    const workspace = new Workspace(testDir);
+    const tools = new ToolRegistry();
+    tools.register(new ListDirectoryTool(workspace));
+    tools.register(new ReadFileTool(workspace));
+    tools.register(new SearchFilesTool(workspace));
+    tools.register(new WriteFileTool(workspace));
+    const trace = new ExecutionTrace();
+    const memory = new ProjectMemory(path.join(testDir, ".memory.json"));
+
+    const agent = new Agent(model, tools, trace, memory, { workspaceRoot: testDir, maxIterations: 3 });
+    await agent.run("Improve the project");
+    return agent.getLastInvestigation()!;
+  };
+
+  let state = await checkDiscovery("readme-only", ["README.md"]);
+  assert.strictEqual(state.isGreenfield(), true, "README.md only is greenfield");
+  assert.deepStrictEqual(state.getSpecificationSource(), { type: "user_prompt" });
+  assert.strictEqual(state.hasSpecificationBeenEstablished(), true, "Fallback to user_prompt auto-establishes");
+
+  state = await checkDiscovery("reqs-only", ["REQUIREMENTS.md"]);
+  assert.strictEqual(state.isGreenfield(), true);
+  assert.deepStrictEqual(state.getSpecificationSource(), { type: "file", path: "REQUIREMENTS.md" });
+  assert.strictEqual(state.hasSpecificationBeenEstablished(), false, "Discovered but not yet established");
+
+  state = await checkDiscovery("spec-only", ["SPEC.md"]);
+  assert.strictEqual(state.isGreenfield(), true);
+  assert.deepStrictEqual(state.getSpecificationSource(), { type: "file", path: "SPEC.md" });
+
+  state = await checkDiscovery("multiple-candidates", ["docs/specification.md", "TASK.md", "SPEC.md", "PRODUCT_SPEC.md"]);
+  assert.strictEqual(state.isGreenfield(), true);
+  assert.deepStrictEqual(state.getSpecificationSource(), { type: "file", path: "SPEC.md" }, "SPEC.md is ranked #2, wins over TASK, docs/specification");
+
+  state = await checkDiscovery("no-candidate", [".github/"]);
+  assert.strictEqual(state.isGreenfield(), true);
+  assert.deepStrictEqual(state.getSpecificationSource(), { type: "user_prompt" });
+
+  const testDir = path.join(TMP_TEST_DIR, "read-readme");
+  fs.mkdirSync(testDir, { recursive: true });
+  fs.writeFileSync(path.join(testDir, "REQUIREMENTS.md"), "# req");
+  fs.writeFileSync(path.join(testDir, "README.md"), "# readme");
+  const model = new FakeModelProvider([
+    { content: "", toolCalls: [{ id: "c1", name: "search_files", arguments: { query: "Improve" } }] },
+    { content: "", toolCalls: [{ id: "c2", name: "list_directory", arguments: { path: "." } }] },
+    { content: "", toolCalls: [{ id: "c3", name: "read_file", arguments: { path: "README.md" } }] },
+    { content: "done", toolCalls: [] }
+  ]);
+  const workspace = new Workspace(testDir);
+  const tools = new ToolRegistry();
+  tools.register(new ListDirectoryTool(workspace));
+  tools.register(new ReadFileTool(workspace));
+  tools.register(new SearchFilesTool(workspace));
+  tools.register(new WriteFileTool(workspace));
+  const trace = new ExecutionTrace();
+  const memory = new ProjectMemory(path.join(testDir, ".memory.json"));
+  const agent = new Agent(model, tools, trace, memory, { workspaceRoot: testDir, maxIterations: 4 });
+  await agent.run("Improve the project");
+  state = agent.getLastInvestigation()!;
+
+  assert.strictEqual(state.hasSpecificationBeenEstablished(), false);
+
+  console.log("PASS: G. Greenfield discovery ranking and strict establishment works");
+}
